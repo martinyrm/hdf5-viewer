@@ -324,6 +324,7 @@ struct AppState {
     std::string gl_renderer;
     std::string gl_version;
     std::string glsl_version;
+    float ui_framebuffer_scale = 1.0f;
     double last_frame_ms = 0.0;
     int last_event_count = 0;
     bool last_used_idle_wait = false;
@@ -2944,6 +2945,7 @@ void draw_performance_hud(AppState &app) {
     ImGui::TextWrapped("GL renderer: %s", app.gl_renderer.c_str());
     ImGui::TextWrapped("GL version: %s", app.gl_version.c_str());
     ImGui::TextWrapped("GLSL: %s", app.glsl_version.c_str());
+    ImGui::Text("UI font framebuffer scale: %.2f", app.ui_framebuffer_scale);
     ImGui::Text("Max texture size: %d", app.gl_max_texture_size);
     ImGui::End();
 }
@@ -3247,7 +3249,22 @@ ImPlotColormap register_turbo_colormap() {
     return ImPlot::AddColormap("Turbo", colors.data(), static_cast<int>(colors.size()), false);
 }
 
-void load_ui_font(ImGuiIO &io) {
+float framebuffer_font_scale(SDL_Window *window) {
+    int window_w = 0;
+    int window_h = 0;
+    int drawable_w = 0;
+    int drawable_h = 0;
+    SDL_GetWindowSize(window, &window_w, &window_h);
+    SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+    if (window_w <= 0 || window_h <= 0 || drawable_w <= 0 || drawable_h <= 0) {
+        return 1.0f;
+    }
+    const float scale_x = static_cast<float>(drawable_w) / static_cast<float>(window_w);
+    const float scale_y = static_cast<float>(drawable_h) / static_cast<float>(window_h);
+    return std::clamp(std::max(scale_x, scale_y), 1.0f, 4.0f);
+}
+
+void load_ui_font(ImGuiIO &io, float framebuffer_scale) {
     static const std::array<const char *, 6> candidates = {
         "/System/Library/Fonts/Supplemental/Verdana.ttf",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -3257,13 +3274,17 @@ void load_ui_font(ImGuiIO &io) {
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     };
 
+    const float baked_size = 16.0f * std::max(1.0f, framebuffer_scale);
+    io.FontGlobalScale = 1.0f / std::max(1.0f, framebuffer_scale);
+
     for (const char *path : candidates) {
         if (std::filesystem::exists(path)) {
             ImFontConfig cfg;
-            cfg.OversampleH = 2;
+            cfg.OversampleH = 3;
             cfg.OversampleV = 2;
+            cfg.PixelSnapH = true;
             cfg.RasterizerMultiply = 1.05f;
-            if (io.Fonts->AddFontFromFileTTF(path, 16.0f, &cfg) != nullptr) {
+            if (io.Fonts->AddFontFromFileTTF(path, baked_size, &cfg) != nullptr) {
                 return;
             }
         }
@@ -3345,7 +3366,8 @@ int main(int argc, char **argv) {
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    load_ui_font(io);
+    const float ui_framebuffer_scale = framebuffer_font_scale(window);
+    load_ui_font(io, ui_framebuffer_scale);
 
     ImGui::StyleColorsDark();
     ImPlot::GetStyle().Colormap = register_turbo_colormap();
@@ -3354,6 +3376,7 @@ int main(int argc, char **argv) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     AppState app;
+    app.ui_framebuffer_scale = ui_framebuffer_scale;
     app.gl_vendor = gl_string(GL_VENDOR);
     app.gl_renderer = gl_string(GL_RENDERER);
     app.gl_version = gl_string(GL_VERSION);
