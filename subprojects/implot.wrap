@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/epezent/implot.git
+revision = v0.16
+depth = 1
+patch_directory = implot
+
+[provide]
+implot = implot_dep
