@@ -78,6 +78,7 @@ using H5File = H5Object<H5Fclose>;
 using H5Dataset = H5Object<H5Dclose>;
 using H5Space = H5Object<H5Sclose>;
 using H5Type = H5Object<H5Tclose>;
+using H5Prop = H5Object<H5Pclose>;
 
 H5File open_readonly_file(const std::string &path, bool prefer_swmr = false, bool *opened_swmr = nullptr) {
     if (opened_swmr != nullptr) {
@@ -127,6 +128,17 @@ struct DatasetInfo {
     bool numeric = false;
     bool scalar = false;
     hsize_t element_count = 0;
+    H5D_layout_t layout = H5D_LAYOUT_ERROR;
+    std::vector<hsize_t> chunk_dims;
+    hsize_t storage_size = 0;
+    std::vector<std::string> filters;
+};
+
+struct DatasetTreeNode {
+    std::string name;
+    std::string path;
+    int dataset_index = -1;
+    std::vector<DatasetTreeNode> children;
 };
 
 struct AxisSpec {
@@ -188,6 +200,15 @@ struct LoadConfig {
     std::string y_fallback_label = "row";
 };
 
+struct TexturePreviewPlan {
+    bool valid = false;
+    hsize_t row_stride = 1;
+    hsize_t col_stride = 1;
+    hsize_t rows = 0;
+    hsize_t cols = 0;
+    hsize_t cells = 0;
+};
+
 struct LoadResult {
     int token = 0;
     bool ok = false;
@@ -226,10 +247,17 @@ struct RangeControl {
     double max = 1.0;
 };
 
+struct ColorRangeControl {
+    bool auto_min = true;
+    bool auto_max = true;
+    double min = 0.0;
+    double max = 1.0;
+};
+
 struct PlotControls {
     RangeControl x;
     RangeControl y;
-    RangeControl color;
+    ColorRangeControl color;
 };
 
 struct FileTab {
@@ -238,18 +266,21 @@ struct FileTab {
     std::array<char, 256> filter{};
     std::string current_file;
     std::vector<DatasetInfo> datasets;
+    DatasetTreeNode dataset_tree;
     int selected_index = -1;
     int x_axis_index = -2; // -2 auto, -1 indices, >=0 dataset index
     int y_axis_index = -2; // 2D only: -2 auto, -1 row/column indices, >=0 dataset index
     bool transpose_2d = false;
     bool x_datetime = false;
     bool x_datetime_utc = false;
+    bool show_file_details = false;
     std::string status;
     std::string error;
     std::string caption;
 
     std::future<LoadResult> load_future;
     bool loading = false;
+    bool loading_quiet = false;
     bool loading_preserve_controls = false;
     int load_token = 0;
     std::shared_ptr<LoadedDataset> loaded;
@@ -364,6 +395,64 @@ std::string type_label(H5T_class_t type_class) {
     }
 }
 
+std::string layout_label(H5D_layout_t layout) {
+    switch (layout) {
+    case H5D_COMPACT:
+        return "compact";
+    case H5D_CONTIGUOUS:
+        return "contiguous";
+    case H5D_CHUNKED:
+        return "chunked";
+    case H5D_VIRTUAL:
+        return "virtual";
+    default:
+        return "unknown";
+    }
+}
+
+std::string filter_label(H5Z_filter_t filter_id, const char *name, const std::vector<unsigned int> &params) {
+    std::string label;
+    if (name != nullptr && name[0] != '\0') {
+        label = name;
+    } else {
+        switch (filter_id) {
+        case H5Z_FILTER_DEFLATE:
+            label = "deflate";
+            break;
+        case H5Z_FILTER_SHUFFLE:
+            label = "shuffle";
+            break;
+        case H5Z_FILTER_FLETCHER32:
+            label = "fletcher32";
+            break;
+        case H5Z_FILTER_SZIP:
+            label = "szip";
+            break;
+        case H5Z_FILTER_NBIT:
+            label = "nbit";
+            break;
+        case H5Z_FILTER_SCALEOFFSET:
+            label = "scaleoffset";
+            break;
+        default:
+            label = "filter " + std::to_string(static_cast<int>(filter_id));
+            break;
+        }
+    }
+
+    if (!params.empty()) {
+        label += " (";
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (i != 0) {
+                label += ", ";
+            }
+            label += std::to_string(params[i]);
+        }
+        label += ")";
+    }
+    return label;
+}
+
 std::string count_label(hsize_t count) {
     if (count < 1000) {
         return std::to_string(count);
@@ -376,6 +465,20 @@ std::string count_label(hsize_t count) {
     } else {
         out << (static_cast<double>(count) / 1000000.0) << "M";
     }
+    return out.str();
+}
+
+std::string bytes_label(long double bytes) {
+    static const std::array<const char *, 5> units = {"B", "KiB", "MiB", "GiB", "TiB"};
+    size_t unit = 0;
+    while (bytes >= 1024.0L && unit + 1 < units.size()) {
+        bytes /= 1024.0L;
+        ++unit;
+    }
+    std::ostringstream out;
+    out.setf(std::ios::fixed);
+    out.precision(unit == 0 ? 0 : 2);
+    out << static_cast<double>(bytes) << " " << units[unit];
     return out.str();
 }
 
@@ -392,6 +495,32 @@ size_t checked_count(const std::vector<hsize_t> &dims) {
 
 hsize_t ceil_div(hsize_t value, hsize_t divisor) {
     return (value + divisor - 1) / divisor;
+}
+
+TexturePreviewPlan plan_texture_preview(const DatasetInfo &info, int max_texture_side, size_t max_texture_cells) {
+    TexturePreviewPlan plan;
+    if (info.dims.size() != 2 || info.dims[0] == 0 || info.dims[1] == 0 || max_texture_side <= 0 || max_texture_cells == 0) {
+        return plan;
+    }
+
+    plan.row_stride = std::max<hsize_t>(1, ceil_div(info.dims[0], static_cast<hsize_t>(max_texture_side)));
+    plan.col_stride = std::max<hsize_t>(1, ceil_div(info.dims[1], static_cast<hsize_t>(max_texture_side)));
+    const auto update_counts = [&]() {
+        plan.rows = 1 + (info.dims[0] - 1) / plan.row_stride;
+        plan.cols = 1 + (info.dims[1] - 1) / plan.col_stride;
+        plan.cells = plan.rows * plan.cols;
+    };
+    update_counts();
+    while (plan.cells > static_cast<hsize_t>(max_texture_cells)) {
+        if (info.dims[0] / plan.row_stride > info.dims[1] / plan.col_stride) {
+            ++plan.row_stride;
+        } else {
+            ++plan.col_stride;
+        }
+        update_counts();
+    }
+    plan.valid = true;
+    return plan;
 }
 
 bool numeric_hdf5_type_class(H5T_class_t type_class) {
@@ -454,6 +583,26 @@ bool contains_case_insensitive(const std::string &haystack, const std::string &n
                    std::tolower(static_cast<unsigned char>(rhs));
         });
     return it != haystack.end();
+}
+
+std::vector<std::string> split_hdf5_path(const std::string &path) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (start < path.size()) {
+        while (start < path.size() && path[start] == '/') {
+            ++start;
+        }
+        if (start >= path.size()) {
+            break;
+        }
+        const size_t end = path.find('/', start);
+        parts.push_back(path.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return parts;
 }
 
 bool looks_like_unix_time_axis(const LoadedDataset &data) {
@@ -521,6 +670,39 @@ DatasetInfo inspect_dataset(hid_t file, const std::string &open_path, const std:
         }
     }
     info.element_count = info.scalar ? 1 : static_cast<hsize_t>(checked_count(info.dims));
+    info.storage_size = H5Dget_storage_size(dataset.get());
+
+    H5Prop create_plist(H5Dget_create_plist(dataset.get()));
+    if (create_plist.valid()) {
+        info.layout = H5Pget_layout(create_plist.get());
+        if (info.layout == H5D_CHUNKED && rank > 0) {
+            info.chunk_dims.resize(static_cast<size_t>(rank));
+            if (H5Pget_chunk(create_plist.get(), rank, info.chunk_dims.data()) < 0) {
+                info.chunk_dims.clear();
+            }
+        }
+
+        const int filter_count = H5Pget_nfilters(create_plist.get());
+        for (int filter_index = 0; filter_index < filter_count; ++filter_index) {
+            unsigned int flags = 0;
+            size_t cd_count = 32;
+            std::array<unsigned int, 32> cd_values{};
+            char filter_name[128] = {};
+            unsigned int filter_config = 0;
+            const H5Z_filter_t filter_id =
+                H5Pget_filter2(create_plist.get(), static_cast<unsigned>(filter_index), &flags, &cd_count, cd_values.data(),
+                               sizeof(filter_name), filter_name, &filter_config);
+            if (filter_id >= 0) {
+                const size_t used_params = std::min(cd_count, cd_values.size());
+                std::vector<unsigned int> params(cd_values.begin(), cd_values.begin() + static_cast<std::ptrdiff_t>(used_params));
+                std::string label = filter_label(filter_id, filter_name, params);
+                if ((flags & H5Z_FLAG_OPTIONAL) != 0) {
+                    label += " optional";
+                }
+                info.filters.push_back(std::move(label));
+            }
+        }
+    }
     return info;
 }
 
@@ -818,6 +1000,39 @@ std::string load_comment_caption(const std::string &path, const std::vector<Data
     return collect_comment_caption(file.get(), datasets);
 }
 
+void rebuild_dataset_tree(FileTab &tab) {
+    tab.dataset_tree = {};
+    tab.dataset_tree.name = "/";
+    tab.dataset_tree.path = "/";
+
+    for (int index = 0; index < static_cast<int>(tab.datasets.size()); ++index) {
+        const DatasetInfo &info = tab.datasets[static_cast<size_t>(index)];
+        const std::vector<std::string> parts = split_hdf5_path(info.path);
+        if (parts.empty()) {
+            continue;
+        }
+
+        DatasetTreeNode *node = &tab.dataset_tree;
+        std::string current_path;
+        for (size_t part_index = 0; part_index < parts.size(); ++part_index) {
+            const std::string &part = parts[part_index];
+            current_path += "/" + part;
+            auto child = std::find_if(node->children.begin(), node->children.end(), [&](const DatasetTreeNode &candidate) {
+                return candidate.name == part;
+            });
+            if (child == node->children.end()) {
+                DatasetTreeNode new_node;
+                new_node.name = part;
+                new_node.path = current_path;
+                node->children.push_back(std::move(new_node));
+                child = std::prev(node->children.end());
+            }
+            node = &*child;
+        }
+        node->dataset_index = index;
+    }
+}
+
 unsigned cpu_worker_limit() {
     static const unsigned limit = [] {
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
@@ -948,6 +1163,14 @@ void normalize_range(double &min_value, double &max_value) {
         min_value -= pad;
         max_value += pad;
     }
+}
+
+std::pair<double, double> effective_range(double min_value, double max_value) {
+    if (!std::isfinite(min_value) || !std::isfinite(max_value)) {
+        return {0.0, 1.0};
+    }
+    normalize_range(min_value, max_value);
+    return {min_value, max_value};
 }
 
 uint8_t to_byte(float value) {
@@ -1411,20 +1634,14 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
         }
 
         if (info.dims.size() == 2) {
-            hsize_t row_stride = std::max<hsize_t>(1, ceil_div(info.dims[0], static_cast<hsize_t>(config.max_texture_side)));
-            hsize_t col_stride = std::max<hsize_t>(1, ceil_div(info.dims[1], static_cast<hsize_t>(config.max_texture_side)));
-            while ((1 + (info.dims[0] - 1) / row_stride) * (1 + (info.dims[1] - 1) / col_stride) >
-                   static_cast<hsize_t>(config.max_texture_cells)) {
-                if (info.dims[0] / row_stride > info.dims[1] / col_stride) {
-                    ++row_stride;
-                } else {
-                    ++col_stride;
-                }
+            const TexturePreviewPlan plan = plan_texture_preview(info, config.max_texture_side, config.max_texture_cells);
+            if (!plan.valid) {
+                throw std::runtime_error("could not plan 2D texture preview");
             }
 
             hsize_t rows = 0;
             hsize_t cols = 0;
-            std::vector<float> values = read_2d_dataset(file_path, info, row_stride, col_stride, rows, cols);
+            std::vector<float> values = read_2d_dataset(file_path, info, plan.row_stride, plan.col_stride, rows, cols);
             hsize_t texture_rows = rows;
             hsize_t texture_cols = cols;
             if (config.transpose_2d) {
@@ -1440,8 +1657,8 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
             result.data->kind = LoadedKind::Heatmap2D;
             result.data->source_rows = info.dims[0];
             result.data->source_cols = info.dims[1];
-            result.data->row_stride = row_stride;
-            result.data->col_stride = col_stride;
+            result.data->row_stride = plan.row_stride;
+            result.data->col_stride = plan.col_stride;
             result.data->texture_height = static_cast<int>(texture_rows);
             result.data->texture_width = static_cast<int>(texture_cols);
             result.data->rgba = std::move(rgba);
@@ -1454,9 +1671,9 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
                              config.x_fallback_label, result.data->x_min, result.data->x_max, result.data->x_label);
             apply_axis_range(file_path, y_axis, 0.0, static_cast<double>(config.y_fallback_count - 1),
                              config.y_fallback_label, result.data->y_min, result.data->y_max, result.data->y_label);
-            if (row_stride > 1 || col_stride > 1) {
-                result.data->note = "Texture preview sampled every " + std::to_string(row_stride) + " row(s) and " +
-                                    std::to_string(col_stride) + " column(s).";
+            if (plan.row_stride > 1 || plan.col_stride > 1) {
+                result.data->note = "Texture preview sampled every " + std::to_string(plan.row_stride) + " row(s) and " +
+                                    std::to_string(plan.col_stride) + " column(s).";
             }
             result.ok = true;
             return result;
@@ -1522,6 +1739,7 @@ void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, float min_val
 void invalidate_plot(FileTab &tab) {
     tab.loaded.reset();
     tab.line_cache = {};
+    tab.loading_quiet = false;
     tab.loading_preserve_controls = false;
     delete_heat_texture(tab);
 }
@@ -1539,7 +1757,7 @@ void reset_controls_from_data(FileTab &tab, const LoadedDataset &data) {
     tab.x_datetime_utc = false;
 }
 
-PlotControls frozen_controls_for_refresh(const FileTab &tab) {
+PlotControls preserved_controls_for_reload(const FileTab &tab) {
     PlotControls controls = tab.controls;
     if (!tab.loaded) {
         return controls;
@@ -1549,22 +1767,29 @@ PlotControls frozen_controls_for_refresh(const FileTab &tab) {
     if (controls.x.automatic) {
         controls.x.min = data.x_min;
         controls.x.max = data.x_max;
-        controls.x.automatic = false;
     }
     if (controls.y.automatic) {
         controls.y.min = data.kind == LoadedKind::Line1D ? data.value_min : data.y_min;
         controls.y.max = data.kind == LoadedKind::Line1D ? data.value_max : data.y_max;
-        controls.y.automatic = false;
     }
-    if (data.kind == LoadedKind::Heatmap2D && controls.color.automatic) {
-        controls.color.min = data.value_min;
-        controls.color.max = data.value_max;
-        controls.color.automatic = false;
+    if (data.kind == LoadedKind::Heatmap2D) {
+        if (controls.color.auto_min) {
+            controls.color.min = data.value_min;
+        }
+        if (controls.color.auto_max) {
+            controls.color.max = data.value_max;
+        }
     }
     normalize_range(controls.x.min, controls.x.max);
     normalize_range(controls.y.min, controls.y.max);
-    normalize_range(controls.color.min, controls.color.max);
     return controls;
+}
+
+std::pair<float, float> effective_color_range(const ColorRangeControl &control, const LoadedDataset &data) {
+    const double raw_min = control.auto_min ? static_cast<double>(data.value_min) : control.min;
+    const double raw_max = control.auto_max ? static_cast<double>(data.value_max) : control.max;
+    const auto [min_value, max_value] = effective_range(raw_min, raw_max);
+    return {static_cast<float>(min_value), static_cast<float>(max_value)};
 }
 
 void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = false, bool preserve_plot = false,
@@ -1579,7 +1804,7 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
     }
     tab.selected_index = index;
     if (preserve_controls) {
-        tab.preserved_controls = frozen_controls_for_refresh(tab);
+        tab.preserved_controls = preserved_controls_for_reload(tab);
     }
     if (!preserve_plot) {
         invalidate_plot(tab);
@@ -1631,8 +1856,11 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
     config.y_fallback_label = std::move(y_fallback_label);
 
     tab.loading = true;
+    tab.loading_quiet = preserve_plot;
     tab.loading_preserve_controls = preserve_controls;
-    tab.status = preserve_plot ? "Refreshing " + info.path + "..." : "Loading " + info.path + "...";
+    if (!preserve_plot) {
+        tab.status = "Loading " + info.path + "...";
+    }
     tab.error.clear();
     tab.load_future = std::async(std::launch::async, load_dataset_worker, token, tab.current_file, info, x_axis, y_axis,
                                  x_axis_info, has_x_axis_info, config);
@@ -1650,6 +1878,8 @@ bool poll_load(FileTab &tab) {
 
     LoadResult result = tab.load_future.get();
     tab.loading = false;
+    const bool quiet_load = tab.loading_quiet;
+    tab.loading_quiet = false;
     const bool preserve_controls = tab.loading_preserve_controls;
     const PlotControls preserved_controls = tab.preserved_controls;
     tab.loading_preserve_controls = false;
@@ -1658,8 +1888,10 @@ bool poll_load(FileTab &tab) {
     }
 
     if (!result.ok) {
-        tab.error = result.error;
-        tab.status = "Load failed.";
+        if (!quiet_load) {
+            tab.error = result.error;
+            tab.status = "Load failed.";
+        }
         return true;
     }
 
@@ -1675,12 +1907,14 @@ bool poll_load(FileTab &tab) {
     }
     if (tab.loaded && tab.loaded->kind == LoadedKind::Heatmap2D) {
         upload_heat_texture(tab, *tab.loaded);
-        if (preserve_controls && !tab.controls.color.automatic) {
-            update_heat_texture_colors(tab, *tab.loaded, static_cast<float>(tab.controls.color.min),
-                                       static_cast<float>(tab.controls.color.max));
+        if (preserve_controls && (!tab.controls.color.auto_min || !tab.controls.color.auto_max)) {
+            const auto [color_min, color_max] = effective_color_range(tab.controls.color, *tab.loaded);
+            update_heat_texture_colors(tab, *tab.loaded, color_min, color_max);
         }
     }
-    tab.status = tab.loaded ? "Loaded " + tab.loaded->info.path : "Loaded.";
+    if (!quiet_load) {
+        tab.status = tab.loaded ? "Loaded " + tab.loaded->info.path : "Loaded.";
+    }
     return true;
 }
 
@@ -1695,6 +1929,7 @@ void open_file_in_tab(AppState &app, FileTab &tab, const std::string &path) {
 
     invalidate_plot(tab);
     tab.datasets.clear();
+    rebuild_dataset_tree(tab);
     tab.selected_index = -1;
     tab.x_axis_index = -2;
     tab.y_axis_index = -2;
@@ -1712,6 +1947,7 @@ void open_file_in_tab(AppState &app, FileTab &tab, const std::string &path) {
     try {
         bool opened_swmr = false;
         tab.datasets = load_file_index(path, &opened_swmr);
+        rebuild_dataset_tree(tab);
         tab.swmr_available = opened_swmr;
         tab.caption = load_comment_caption(path, tab.datasets);
         tab.status = "Found " + std::to_string(tab.datasets.size()) + " datasets.";
@@ -1845,6 +2081,7 @@ bool poll_swmr_live(AppState &app, FileTab &tab) {
             }
 
             tab.datasets = std::move(result.datasets);
+            rebuild_dataset_tree(tab);
             const int selected_index = find_dataset_index_by_path(tab.datasets, result.selected_path);
             if (selected_index < 0) {
                 tab.live_status = "Live SWMR: selected dataset disappeared.";
@@ -2050,30 +2287,64 @@ void draw_range_control(const char *label, RangeControl &range, double auto_min,
     ImGui::PushID(label);
     ImGui::Checkbox(label, &range.automatic);
     ImGui::SameLine();
-    const float width = std::max(80.0f, (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f);
+    const float input_width = ImGui::CalcTextSize("-8.8888e+88").x + ImGui::GetStyle().FramePadding.x * 2.0f;
     if (range.automatic) {
         ImGui::BeginDisabled();
         double min_value = auto_min;
         double max_value = auto_max;
-        ImGui::SetNextItemWidth(width);
+        ImGui::SetNextItemWidth(input_width);
         ImGui::InputDouble("##min", &min_value, 0.0, 0.0, "%.6g");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(width);
+        ImGui::SetNextItemWidth(input_width);
         ImGui::InputDouble("##max", &max_value, 0.0, 0.0, "%.6g");
         ImGui::EndDisabled();
         range.min = auto_min;
         range.max = auto_max;
     } else {
         bool changed = false;
-        ImGui::SetNextItemWidth(width);
+        ImGui::SetNextItemWidth(input_width);
         changed |= ImGui::InputDouble("##min", &range.min, 0.0, 0.0, "%.6g");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(width);
+        ImGui::SetNextItemWidth(input_width);
         changed |= ImGui::InputDouble("##max", &range.max, 0.0, 0.0, "%.6g");
         if (changed) {
             normalize_range(range.min, range.max);
         }
     }
+    ImGui::PopID();
+}
+
+void draw_color_range_control(ColorRangeControl &range, double auto_min, double auto_max) {
+    ImGui::PushID("ColorRange");
+    const float input_width = ImGui::CalcTextSize("-8.8888e+88").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+
+    if (ImGui::Checkbox("Auto Min", &range.auto_min) && range.auto_min) {
+        range.min = auto_min;
+    }
+    ImGui::SameLine();
+    if (range.auto_min) {
+        range.min = auto_min;
+    }
+    ImGui::BeginDisabled(range.auto_min);
+    ImGui::SetNextItemWidth(input_width);
+    ImGui::InputDouble("##color-min", &range.min, 0.0, 0.0, "%.6g");
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    ImGui::Spacing();
+    ImGui::SameLine();
+
+    if (ImGui::Checkbox("Auto Max", &range.auto_max) && range.auto_max) {
+        range.max = auto_max;
+    }
+    ImGui::SameLine();
+    if (range.auto_max) {
+        range.max = auto_max;
+    }
+    ImGui::BeginDisabled(range.auto_max);
+    ImGui::SetNextItemWidth(input_width);
+    ImGui::InputDouble("##color-max", &range.max, 0.0, 0.0, "%.6g");
+    ImGui::EndDisabled();
     ImGui::PopID();
 }
 
@@ -2089,18 +2360,18 @@ void draw_axis_combo(AppState &app, FileTab &tab, const char *label, int &axis_i
     if (ImGui::BeginCombo(label, preview.c_str())) {
         if (ImGui::Selectable("Auto", axis_index == -2)) {
             axis_index = -2;
-            start_load(app, tab, tab.selected_index, true);
+            start_load(app, tab, tab.selected_index, true, false, true);
         }
         if (ImGui::Selectable(index_label, axis_index == -1)) {
             axis_index = -1;
-            start_load(app, tab, tab.selected_index, true);
+            start_load(app, tab, tab.selected_index, true, false, true);
         }
         ImGui::Separator();
         for (int candidate_index : compatible) {
             const DatasetInfo &axis = tab.datasets[static_cast<size_t>(candidate_index)];
             if (ImGui::Selectable(axis.path.c_str(), axis_index == candidate_index)) {
                 axis_index = candidate_index;
-                start_load(app, tab, tab.selected_index, true);
+                start_load(app, tab, tab.selected_index, true, false, true);
             }
         }
         ImGui::EndCombo();
@@ -2116,14 +2387,15 @@ void draw_axis_selector(AppState &app, FileTab &tab) {
         return;
     }
 
-    ImGui::BeginDisabled(tab.loading);
+    const bool blocking_load = tab.loading && !tab.loading_quiet;
+    ImGui::BeginDisabled(blocking_load);
     if (target.dims.size() == 2) {
         bool transpose = tab.transpose_2d;
         if (ImGui::Checkbox("Flip X/Y", &transpose)) {
             tab.transpose_2d = transpose;
             tab.x_axis_index = -2;
             tab.y_axis_index = -2;
-            start_load(app, tab, tab.selected_index, true);
+            start_load(app, tab, tab.selected_index, true, false, true);
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Transpose 2D datasets so rows are shown on X and columns on Y.");
@@ -2139,9 +2411,85 @@ void draw_axis_selector(AppState &app, FileTab &tab) {
     ImGui::EndDisabled();
 }
 
+std::string dataset_row_label(const DatasetInfo &info, bool full_path) {
+    const std::string name = full_path ? info.path : base_name(info.path);
+    return name + "  [" + shape_label(info.dims) + ", " + type_label(info.type_class) + "]";
+}
+
+void draw_dataset_tooltip(const DatasetInfo &info) {
+    if (!ImGui::IsItemHovered()) {
+        return;
+    }
+
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(info.path.c_str());
+    ImGui::Text("shape: %s", shape_label(info.dims).c_str());
+    ImGui::Text("type: %s, values: %s", type_label(info.type_class).c_str(), count_label(info.element_count).c_str());
+    ImGui::EndTooltip();
+}
+
+void select_dataset_from_browser(AppState &app, FileTab &tab, int index) {
+    start_load(app, tab, index);
+    app.active_tab_id = tab.id;
+    app.plot_focus_request_id = tab.id;
+}
+
+void draw_dataset_leaf(AppState &app, FileTab &tab, int index, bool full_path) {
+    if (index < 0 || index >= static_cast<int>(tab.datasets.size())) {
+        return;
+    }
+
+    const DatasetInfo &info = tab.datasets[static_cast<size_t>(index)];
+    const std::string label = dataset_row_label(info, full_path);
+    ImGui::PushID(index);
+    ImGui::BeginDisabled(tab.loading && !tab.loading_quiet);
+    if (ImGui::Selectable(label.c_str(), index == tab.selected_index, ImGuiSelectableFlags_SpanAvailWidth)) {
+        select_dataset_from_browser(app, tab, index);
+    }
+    ImGui::EndDisabled();
+    draw_dataset_tooltip(info);
+    ImGui::PopID();
+}
+
+bool tree_contains_path(const DatasetTreeNode &node, const std::string &dataset_path) {
+    if (dataset_path == node.path) {
+        return true;
+    }
+    const std::string prefix = node.path == "/" ? "/" : node.path + "/";
+    return dataset_path.size() > prefix.size() && dataset_path.compare(0, prefix.size(), prefix) == 0;
+}
+
+void draw_dataset_tree_node(AppState &app, FileTab &tab, const DatasetTreeNode &node) {
+    if (node.children.empty()) {
+        draw_dataset_leaf(app, tab, node.dataset_index, false);
+        return;
+    }
+
+    std::string selected_path;
+    if (tab.selected_index >= 0 && tab.selected_index < static_cast<int>(tab.datasets.size())) {
+        selected_path = tab.datasets[static_cast<size_t>(tab.selected_index)].path;
+    }
+    const bool contains_selected = !selected_path.empty() && tree_contains_path(node, selected_path);
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                               ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (contains_selected) {
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    }
+
+    ImGui::PushID(node.path.c_str());
+    const bool open = ImGui::TreeNodeEx(node.name.c_str(), flags);
+    if (open) {
+        for (const DatasetTreeNode &child : node.children) {
+            draw_dataset_tree_node(app, tab, child);
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
 void draw_dataset_panel(AppState &app, FileTab &tab) {
     ImGui::InputText("File", tab.file_path.data(), tab.file_path.size());
-    ImGui::BeginDisabled(tab.loading);
+    ImGui::BeginDisabled(tab.loading && !tab.loading_quiet);
     if (ImGui::Button("Reload", ImVec2(-1, 0))) {
         const std::string path = trim(tab.file_path.data());
         if (!path.empty()) {
@@ -2149,9 +2497,13 @@ void draw_dataset_panel(AppState &app, FileTab &tab) {
         }
     }
     ImGui::EndDisabled();
+    if (ImGui::Button("File Details", ImVec2(-1, 0))) {
+        tab.show_file_details = true;
+    }
 
     ImGui::Separator();
-    ImGui::InputText("Filter", tab.filter.data(), tab.filter.size());
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##dataset-search", "Search datasets", tab.filter.data(), tab.filter.size());
     ImGui::TextUnformatted(tab.status.c_str());
     if (!tab.error.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", tab.error.c_str());
@@ -2163,47 +2515,20 @@ void draw_dataset_panel(AppState &app, FileTab &tab) {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Poll an active SWMR writer and reload the selected plot when its dataset extent changes.");
     }
-    if (!tab.live_status.empty()) {
-        ImGui::TextDisabled("%s", tab.live_status.c_str());
-    }
     draw_axis_selector(app, tab);
 
     ImGui::BeginChild("dataset-list", ImVec2(0, 0), true);
     const std::string filter = trim(tab.filter.data());
-    const auto draw_dataset_row = [&](int i) {
-        const DatasetInfo &info = tab.datasets[static_cast<size_t>(i)];
-        const std::string row = info.path + "  [" + shape_label(info.dims) + ", " + type_label(info.type_class) + "]";
-        ImGui::BeginDisabled(tab.loading);
-        if (ImGui::Selectable(row.c_str(), i == tab.selected_index)) {
-            start_load(app, tab, i);
-            app.active_tab_id = tab.id;
-            app.plot_focus_request_id = tab.id;
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(info.path.c_str());
-            ImGui::Text("shape: %s", shape_label(info.dims).c_str());
-            ImGui::Text("type: %s, values: %s", type_label(info.type_class).c_str(), count_label(info.element_count).c_str());
-            ImGui::EndTooltip();
-        }
-    };
-
     if (filter.empty()) {
-        ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(tab.datasets.size()));
-        while (clipper.Step()) {
-            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                draw_dataset_row(i);
-            }
+        for (const DatasetTreeNode &child : tab.dataset_tree.children) {
+            draw_dataset_tree_node(app, tab, child);
         }
     } else {
         std::vector<int> visible_indices;
         visible_indices.reserve(tab.datasets.size());
         for (int i = 0; i < static_cast<int>(tab.datasets.size()); ++i) {
             const DatasetInfo &info = tab.datasets[static_cast<size_t>(i)];
-            const std::string row = info.path + "  [" + shape_label(info.dims) + ", " + type_label(info.type_class) + "]";
-            if (contains_case_insensitive(row, filter)) {
+            if (contains_case_insensitive(info.path, filter)) {
                 visible_indices.push_back(i);
             }
         }
@@ -2211,7 +2536,7 @@ void draw_dataset_panel(AppState &app, FileTab &tab) {
         clipper.Begin(static_cast<int>(visible_indices.size()));
         while (clipper.Step()) {
             for (int visible = clipper.DisplayStart; visible < clipper.DisplayEnd; ++visible) {
-                draw_dataset_row(visible_indices[static_cast<size_t>(visible)]);
+                draw_dataset_leaf(app, tab, visible_indices[static_cast<size_t>(visible)], true);
             }
         }
     }
@@ -2229,7 +2554,7 @@ void draw_plot_controls(FileTab &tab, LoadedDataset &data) {
         const double y_auto_max = data.kind == LoadedKind::Line1D ? data.value_max : data.y_max;
         draw_range_control("Auto Y", tab.controls.y, y_auto_min, y_auto_max);
         if (data.kind == LoadedKind::Heatmap2D) {
-            draw_range_control("Auto Color", tab.controls.color, data.value_min, data.value_max);
+            draw_color_range_control(tab.controls.color, data.value_min, data.value_max);
         }
         if (looks_like_unix_time_axis(data)) {
             ImGui::Checkbox("Format X as date/time", &tab.x_datetime);
@@ -2260,7 +2585,7 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
     }
 
     LoadedDataset &data = *tab.loaded;
-    if (tab.loading) {
+    if (tab.loading && !tab.loading_quiet) {
         ImGui::TextDisabled("%s", tab.status.c_str());
     }
     ImGui::Text("%s  [%s, %s]", data.info.path.c_str(), shape_label(data.info.dims).c_str(),
@@ -2310,8 +2635,7 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
     }
 
     if (data.kind == LoadedKind::Heatmap2D) {
-        const float color_min = static_cast<float>(tab.controls.color.automatic ? data.value_min : tab.controls.color.min);
-        const float color_max = static_cast<float>(tab.controls.color.automatic ? data.value_max : tab.controls.color.max);
+        const auto [color_min, color_max] = effective_color_range(tab.controls.color, data);
         update_heat_texture_colors(tab, data, color_min, color_max);
         ImGui::Text("Turbo texture: %d x %d from %s x %s cells, range %.6g to %.6g", data.texture_width,
                     data.texture_height, count_label(data.source_rows).c_str(), count_label(data.source_cols).c_str(),
@@ -2424,6 +2748,79 @@ void request_file_picker(AppState &app) {
         }
     }
     copy_to_buffer(picker.selected_path, picker.directory.string());
+}
+
+bool toggle_axis_autoscale(FileTab &tab, bool x_axis) {
+    if (!tab.loaded || tab.loaded->kind == LoadedKind::Scalar) {
+        return false;
+    }
+
+    LoadedDataset &data = *tab.loaded;
+    RangeControl &range = x_axis ? tab.controls.x : tab.controls.y;
+    range.automatic = !range.automatic;
+    if (range.automatic) {
+        if (x_axis) {
+            range.min = data.x_min;
+            range.max = data.x_max;
+        } else {
+            range.min = data.kind == LoadedKind::Line1D ? data.value_min : data.y_min;
+            range.max = data.kind == LoadedKind::Line1D ? data.value_max : data.y_max;
+        }
+    }
+    return true;
+}
+
+bool flip_active_2d_axes(AppState &app, FileTab &tab) {
+    if (tab.selected_index < 0 || tab.selected_index >= static_cast<int>(tab.datasets.size()) || tab.loading) {
+        return false;
+    }
+    const DatasetInfo &target = tab.datasets[static_cast<size_t>(tab.selected_index)];
+    if (!target.numeric || target.dims.size() != 2) {
+        return false;
+    }
+
+    tab.transpose_2d = !tab.transpose_2d;
+    tab.x_axis_index = -2;
+    tab.y_axis_index = -2;
+    start_load(app, tab, tab.selected_index, true, false, true);
+    return true;
+}
+
+bool toggle_live_swmr(FileTab &tab) {
+    set_live_swmr_enabled(tab, !tab.live_swmr_enabled);
+    return true;
+}
+
+bool handle_keyboard_shortcuts(AppState &app) {
+    ImGuiIO &io = ImGui::GetIO();
+    const bool text_entry_active = io.WantTextInput || ImGui::IsAnyItemActive();
+    const bool open_requested = ImGui::IsKeyPressed(ImGuiKey_O, false) && ((io.KeyCtrl || io.KeySuper) || !text_entry_active);
+    if (open_requested && !app.picker.visible) {
+        request_file_picker(app);
+        return true;
+    }
+
+    if (text_entry_active || app.picker.visible) {
+        return false;
+    }
+
+    FileTab *tab = find_tab(app, app.active_tab_id);
+    if (tab == nullptr) {
+        return false;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+        return toggle_axis_autoscale(*tab, true);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+        return toggle_axis_autoscale(*tab, false);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+        return flip_active_2d_axes(app, *tab);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        return toggle_live_swmr(*tab);
+    }
+    return false;
 }
 
 void draw_file_picker(AppState &app) {
@@ -2551,6 +2948,181 @@ void draw_performance_hud(AppState &app) {
     ImGui::End();
 }
 
+std::string join_labels(const std::vector<std::string> &values, const char *empty_label = "none") {
+    if (values.empty()) {
+        return empty_label;
+    }
+    std::string joined;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            joined += ", ";
+        }
+        joined += values[i];
+    }
+    return joined;
+}
+
+long double logical_dataset_bytes(const DatasetInfo &info) {
+    return static_cast<long double>(info.element_count) * static_cast<long double>(info.type_size);
+}
+
+hsize_t distinct_chunks_for_selection(hsize_t dim, hsize_t stride, hsize_t chunk_dim) {
+    if (dim == 0 || stride == 0 || chunk_dim == 0) {
+        return 0;
+    }
+
+    hsize_t chunks = 0;
+    hsize_t previous_chunk = std::numeric_limits<hsize_t>::max();
+    const hsize_t count = 1 + (dim - 1) / stride;
+    for (hsize_t index = 0; index < count; ++index) {
+        const hsize_t source_index = std::min(dim - 1, index * stride);
+        const hsize_t chunk = source_index / chunk_dim;
+        if (chunk != previous_chunk) {
+            ++chunks;
+            previous_chunk = chunk;
+        }
+    }
+    return chunks;
+}
+
+void draw_dataset_diagnostics_table(const FileTab &tab, int max_texture_side, size_t max_texture_cells) {
+    if (tab.datasets.empty()) {
+        ImGui::TextUnformatted("No datasets indexed.");
+        return;
+    }
+
+    if (!ImGui::BeginTable("dataset-diagnostics", 9,
+                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                               ImGuiTableFlags_ScrollY,
+                           ImVec2(0, 360))) {
+        return;
+    }
+
+    ImGui::TableSetupColumn("Dataset");
+    ImGui::TableSetupColumn("Shape");
+    ImGui::TableSetupColumn("Type");
+    ImGui::TableSetupColumn("Layout");
+    ImGui::TableSetupColumn("Chunk");
+    ImGui::TableSetupColumn("Filters");
+    ImGui::TableSetupColumn("Logical");
+    ImGui::TableSetupColumn("Stored");
+    ImGui::TableSetupColumn("Preview");
+    ImGui::TableHeadersRow();
+
+    for (const DatasetInfo &info : tab.datasets) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(info.path.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(shape_label(info.dims).c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%s/%zu", type_label(info.type_class).c_str(), info.type_size);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(layout_label(info.layout).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(info.chunk_dims.empty() ? "-" : shape_label(info.chunk_dims).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextWrapped("%s", join_labels(info.filters).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(bytes_label(logical_dataset_bytes(info)).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(bytes_label(static_cast<long double>(info.storage_size)).c_str());
+        ImGui::TableNextColumn();
+        if (info.dims.size() == 2 && info.numeric) {
+            const TexturePreviewPlan plan = plan_texture_preview(info, max_texture_side, max_texture_cells);
+            if (plan.valid) {
+                ImGui::Text("%s x %s, stride %s/%s", count_label(plan.rows).c_str(), count_label(plan.cols).c_str(),
+                            count_label(plan.row_stride).c_str(), count_label(plan.col_stride).c_str());
+            } else {
+                ImGui::TextUnformatted("-");
+            }
+        } else {
+            ImGui::TextUnformatted("-");
+        }
+    }
+    ImGui::EndTable();
+}
+
+void draw_selected_dataset_diagnostics(const FileTab &tab, int max_texture_side, size_t max_texture_cells) {
+    if (tab.selected_index < 0 || tab.selected_index >= static_cast<int>(tab.datasets.size())) {
+        ImGui::TextUnformatted("No dataset selected.");
+        return;
+    }
+
+    const DatasetInfo &info = tab.datasets[static_cast<size_t>(tab.selected_index)];
+    ImGui::TextWrapped("Selected: %s", info.path.c_str());
+    ImGui::Text("Shape: %s", shape_label(info.dims).c_str());
+    ImGui::Text("Type: %s, %zu byte%s/value", type_label(info.type_class).c_str(), info.type_size,
+                info.type_size == 1 ? "" : "s");
+    ImGui::Text("Layout: %s", layout_label(info.layout).c_str());
+    ImGui::Text("Chunk: %s", info.chunk_dims.empty() ? "-" : shape_label(info.chunk_dims).c_str());
+    ImGui::TextWrapped("Filters: %s", join_labels(info.filters).c_str());
+    ImGui::Text("Logical payload: %s", bytes_label(logical_dataset_bytes(info)).c_str());
+    ImGui::Text("Allocated storage: %s", bytes_label(static_cast<long double>(info.storage_size)).c_str());
+
+    if (info.dims.size() == 2 && info.numeric) {
+        const TexturePreviewPlan plan = plan_texture_preview(info, max_texture_side, max_texture_cells);
+        if (plan.valid) {
+            ImGui::SeparatorText("Current 2D Preview Plan");
+            ImGui::Text("Texture preview: %s x %s cells", count_label(plan.rows).c_str(), count_label(plan.cols).c_str());
+            ImGui::Text("Read stride: every %s row(s), every %s column(s)", count_label(plan.row_stride).c_str(),
+                        count_label(plan.col_stride).c_str());
+            ImGui::Text("Preview values: %s (%s float buffer)", count_label(plan.cells).c_str(),
+                        bytes_label(static_cast<long double>(plan.cells) * sizeof(float)).c_str());
+            ImGui::Text("RGBA texture upload: %s", bytes_label(static_cast<long double>(plan.cells) * 4.0L).c_str());
+            if (info.layout == H5D_CHUNKED && info.chunk_dims.size() == 2) {
+                const hsize_t row_chunks =
+                    distinct_chunks_for_selection(info.dims[0], plan.row_stride, info.chunk_dims[0]);
+                const hsize_t col_chunks =
+                    distinct_chunks_for_selection(info.dims[1], plan.col_stride, info.chunk_dims[1]);
+                const long double touched_chunks = static_cast<long double>(row_chunks) * static_cast<long double>(col_chunks);
+                const long double chunk_values =
+                    static_cast<long double>(info.chunk_dims[0]) * static_cast<long double>(info.chunk_dims[1]);
+                ImGui::Text("Estimated chunks touched: %.0Lf (%s row chunks x %s column chunks)", touched_chunks,
+                            count_label(row_chunks).c_str(), count_label(col_chunks).c_str());
+                ImGui::Text("Logical bytes per chunk: %s", bytes_label(chunk_values * info.type_size).c_str());
+                ImGui::TextWrapped("If this is close to the full chunk count, a strided preview can still decompress most "
+                                   "of the dataset. Precomputed preview datasets or viewport-tile reads will be faster.");
+            }
+        }
+    }
+}
+
+void draw_file_details_window(const AppState &app, FileTab &tab) {
+    if (!tab.show_file_details) {
+        return;
+    }
+
+    const std::string title = "File Details: " + tab_title(tab) + "##details-" + std::to_string(tab.id);
+    ImGui::SetNextWindowSize(ImVec2(980, 620), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(title.c_str(), &tab.show_file_details)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::TextWrapped("File: %s", tab.current_file.c_str());
+    std::error_code ec;
+    const auto file_size = tab.current_file.empty() ? 0 : std::filesystem::file_size(tab.current_file, ec);
+    if (!ec && file_size > 0) {
+        ImGui::Text("File size: %s", bytes_label(static_cast<long double>(file_size)).c_str());
+    }
+    ImGui::Text("Datasets: %d", static_cast<int>(tab.datasets.size()));
+    ImGui::Text("OpenGL max texture side: %d", app.gl_max_texture_size);
+    ImGui::Text("Preview limits: max side %d, max cells %s", std::max(256, std::min(app.gl_max_texture_size, 4096)),
+                count_label(static_cast<hsize_t>(LoadConfig{}.max_texture_cells)).c_str());
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Selected Dataset", ImGuiTreeNodeFlags_DefaultOpen)) {
+        draw_selected_dataset_diagnostics(tab, std::max(256, std::min(app.gl_max_texture_size, 4096)),
+                                          LoadConfig{}.max_texture_cells);
+    }
+    if (ImGui::CollapsingHeader("All Datasets")) {
+        draw_dataset_diagnostics_table(tab, std::max(256, std::min(app.gl_max_texture_size, 4096)),
+                                       LoadConfig{}.max_texture_cells);
+    }
+    ImGui::End();
+}
+
 void draw_file_tab_content(AppState &app, FileTab &tab) {
     ImGui::PushID(tab.id);
     draw_dataset_panel(app, tab);
@@ -2658,6 +3230,7 @@ void layout_windows(AppState &app) {
         if (focus_requested) {
             app.plot_focus_request_id = 0;
         }
+        draw_file_details_window(app, tab);
     }
 
     draw_file_picker(app);
@@ -2848,6 +3421,7 @@ int main(int argc, char **argv) {
         ImGui::NewFrame();
 
         layout_windows(app);
+        state_changed = handle_keyboard_shortcuts(app) || state_changed;
 
         const bool ui_fast_frames = imgui_wants_fast_frames(io);
         ImGui::Render();
