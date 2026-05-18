@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -37,6 +38,8 @@ namespace {
 
 std::mutex g_hdf5_mutex;
 constexpr std::chrono::milliseconds kSwmrPollInterval(1000);
+constexpr std::chrono::milliseconds kIdleFrameInterval(250);
+constexpr std::chrono::milliseconds kActiveFrameInterval(16);
 
 template <herr_t (*CloseFn)(hid_t)> class H5Object {
   public:
@@ -804,12 +807,27 @@ std::string load_comment_caption(const std::string &path, const std::vector<Data
     return collect_comment_caption(file.get(), datasets);
 }
 
+unsigned cpu_worker_limit() {
+    static const unsigned limit = [] {
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const char *env = std::getenv("HDF5_PLOTTER_MAX_THREADS");
+        if (env != nullptr && env[0] != '\0') {
+            char *end = nullptr;
+            const unsigned long requested = std::strtoul(env, &end, 10);
+            if (end != env && requested > 0) {
+                return static_cast<unsigned>(std::min<unsigned long>(requested, hw));
+            }
+        }
+        return std::min(4u, hw);
+    }();
+    return limit;
+}
+
 void parallel_for(size_t count, const std::function<void(size_t, size_t)> &fn) {
     if (count == 0) {
         return;
     }
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const size_t worker_count = std::min<size_t>(hw, std::max<size_t>(1, count / 262144));
+    const size_t worker_count = std::min<size_t>(cpu_worker_limit(), std::max<size_t>(1, count / 262144));
     if (worker_count <= 1) {
         fn(0, count);
         return;
@@ -832,8 +850,7 @@ std::pair<float, float> finite_minmax(const std::vector<float> &values) {
         return {0.0f, 1.0f};
     }
 
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const size_t worker_count = std::min<size_t>(hw, std::max<size_t>(1, values.size() / 524288));
+    const size_t worker_count = std::min<size_t>(cpu_worker_limit(), std::max<size_t>(1, values.size() / 524288));
     std::vector<float> mins(worker_count, std::numeric_limits<float>::infinity());
     std::vector<float> maxs(worker_count, -std::numeric_limits<float>::infinity());
     std::vector<std::thread> workers;
@@ -1473,8 +1490,12 @@ void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, float min_val
     if (data.kind != LoadedKind::Heatmap2D || data.heat_values.empty() || tab.heat_texture == 0) {
         return;
     }
+    const auto nearly_same = [](float lhs, float rhs) {
+        const float scale = std::max({1.0f, std::abs(lhs), std::abs(rhs)});
+        return std::abs(lhs - rhs) <= scale * 1e-5f;
+    };
     if (std::isfinite(data.applied_color_min) && std::isfinite(data.applied_color_max) &&
-        std::abs(data.applied_color_min - min_value) < 1e-12f && std::abs(data.applied_color_max - max_value) < 1e-12f) {
+        nearly_same(data.applied_color_min, min_value) && nearly_same(data.applied_color_max, max_value)) {
         return;
     }
 
@@ -1606,14 +1627,14 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
                                  x_axis_info, has_x_axis_info, config);
 }
 
-void poll_load(FileTab &tab) {
+bool poll_load(FileTab &tab) {
     if (!tab.loading || !tab.load_future.valid()) {
-        return;
+        return false;
     }
 
     using namespace std::chrono_literals;
     if (tab.load_future.wait_for(0ms) != std::future_status::ready) {
-        return;
+        return false;
     }
 
     LoadResult result = tab.load_future.get();
@@ -1622,13 +1643,13 @@ void poll_load(FileTab &tab) {
     const PlotControls preserved_controls = tab.preserved_controls;
     tab.loading_preserve_controls = false;
     if (result.token != tab.load_token) {
-        return;
+        return true;
     }
 
     if (!result.ok) {
         tab.error = result.error;
         tab.status = "Load failed.";
-        return;
+        return true;
     }
 
     tab.loaded = std::move(result.data);
@@ -1649,6 +1670,7 @@ void poll_load(FileTab &tab) {
         }
     }
     tab.status = tab.loaded ? "Loaded " + tab.loaded->info.path : "Loaded.";
+    return true;
 }
 
 void open_file_in_tab(AppState &app, FileTab &tab, const std::string &path) {
@@ -1770,7 +1792,7 @@ SwmrPollResult swmr_poll_worker(int token, std::string path, std::string selecte
     return result;
 }
 
-void poll_swmr_live(AppState &app, FileTab &tab) {
+bool poll_swmr_live(AppState &app, FileTab &tab) {
     using clock = std::chrono::steady_clock;
 
     if (tab.swmr_polling && tab.swmr_future.valid()) {
@@ -1780,11 +1802,11 @@ void poll_swmr_live(AppState &app, FileTab &tab) {
             tab.swmr_polling = false;
             tab.next_swmr_poll = clock::now() + kSwmrPollInterval;
             if (!tab.live_swmr_enabled || result.token != tab.swmr_token) {
-                return;
+                return true;
             }
             if (!result.ok) {
                 tab.live_status = "Live SWMR: " + result.error;
-                return;
+                return true;
             }
 
             tab.swmr_available = result.opened_swmr;
@@ -1794,12 +1816,12 @@ void poll_swmr_live(AppState &app, FileTab &tab) {
 
             if (!result.selected_shape_changed) {
                 tab.live_status = "Live SWMR refresh enabled.";
-                return;
+                return true;
             }
 
             if (tab.loading) {
                 tab.live_status = "Live SWMR: update detected while another load is running.";
-                return;
+                return true;
             }
 
             std::string axis_path;
@@ -1816,7 +1838,7 @@ void poll_swmr_live(AppState &app, FileTab &tab) {
             if (selected_index < 0) {
                 tab.live_status = "Live SWMR: selected dataset disappeared.";
                 tab.live_swmr_enabled = false;
-                return;
+                return true;
             }
             if (!axis_path.empty()) {
                 const int axis_index = find_dataset_index_by_path(tab.datasets, axis_path);
@@ -1829,18 +1851,18 @@ void poll_swmr_live(AppState &app, FileTab &tab) {
             tab.selected_index = selected_index;
             tab.live_status = "Live SWMR: update detected.";
             start_load(app, tab, selected_index, true, true, true);
-            return;
+            return true;
         }
     }
 
     if (!tab.live_swmr_enabled || tab.swmr_polling || tab.loading || tab.selected_index < 0 ||
         tab.selected_index >= static_cast<int>(tab.datasets.size()) || tab.current_file.empty()) {
-        return;
+        return false;
     }
 
     const clock::time_point now = clock::now();
     if (now < tab.next_swmr_poll) {
-        return;
+        return false;
     }
 
     const DatasetInfo &selected = tab.datasets[static_cast<size_t>(tab.selected_index)];
@@ -1848,6 +1870,7 @@ void poll_swmr_live(AppState &app, FileTab &tab) {
     tab.swmr_polling = true;
     tab.live_status = "Live SWMR: polling...";
     tab.swmr_future = std::async(std::launch::async, swmr_poll_worker, token, tab.current_file, selected.path, selected.dims);
+    return true;
 }
 
 double x_at_index(const LoadedDataset &data, size_t index, size_t source_size) {
@@ -2135,14 +2158,10 @@ void draw_dataset_panel(AppState &app, FileTab &tab) {
     draw_axis_selector(app, tab);
 
     ImGui::BeginChild("dataset-list", ImVec2(0, 0), true);
-    const std::string filter = tab.filter.data();
-    for (int i = 0; i < static_cast<int>(tab.datasets.size()); ++i) {
+    const std::string filter = trim(tab.filter.data());
+    const auto draw_dataset_row = [&](int i) {
         const DatasetInfo &info = tab.datasets[static_cast<size_t>(i)];
         const std::string row = info.path + "  [" + shape_label(info.dims) + ", " + type_label(info.type_class) + "]";
-        if (!contains_case_insensitive(row, filter)) {
-            continue;
-        }
-
         ImGui::BeginDisabled(tab.loading);
         if (ImGui::Selectable(row.c_str(), i == tab.selected_index)) {
             start_load(app, tab, i);
@@ -2156,6 +2175,33 @@ void draw_dataset_panel(AppState &app, FileTab &tab) {
             ImGui::Text("shape: %s", shape_label(info.dims).c_str());
             ImGui::Text("type: %s, values: %s", type_label(info.type_class).c_str(), count_label(info.element_count).c_str());
             ImGui::EndTooltip();
+        }
+    };
+
+    if (filter.empty()) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(tab.datasets.size()));
+        while (clipper.Step()) {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                draw_dataset_row(i);
+            }
+        }
+    } else {
+        std::vector<int> visible_indices;
+        visible_indices.reserve(tab.datasets.size());
+        for (int i = 0; i < static_cast<int>(tab.datasets.size()); ++i) {
+            const DatasetInfo &info = tab.datasets[static_cast<size_t>(i)];
+            const std::string row = info.path + "  [" + shape_label(info.dims) + ", " + type_label(info.type_class) + "]";
+            if (contains_case_insensitive(row, filter)) {
+                visible_indices.push_back(i);
+            }
+        }
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visible_indices.size()));
+        while (clipper.Step()) {
+            for (int visible = clipper.DisplayStart; visible < clipper.DisplayEnd; ++visible) {
+                draw_dataset_row(visible_indices[static_cast<size_t>(visible)]);
+            }
         }
     }
     ImGui::EndChild();
@@ -2622,6 +2668,21 @@ std::string default_file_path(int argc, char **argv) {
     return {};
 }
 
+bool app_has_background_work(const AppState &app) {
+    return std::any_of(app.tabs.begin(), app.tabs.end(), [](const std::unique_ptr<FileTab> &tab) {
+        return tab->loading || tab->swmr_polling;
+    });
+}
+
+bool imgui_wants_fast_frames(const ImGuiIO &io) {
+    for (bool down : io.MouseDown) {
+        if (down) {
+            return true;
+        }
+    }
+    return ImGui::IsAnyItemActive();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2691,24 +2752,39 @@ int main(int argc, char **argv) {
     }
 
     bool done = false;
-    constexpr auto target_frame_duration = std::chrono::milliseconds(16);
+    bool force_redraw = true;
+    auto process_event = [&](const SDL_Event &event) {
+        ImGui_ImplSDL2_ProcessEvent(&event);
+        if (event.type == SDL_QUIT) {
+            done = true;
+        }
+        if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
+            event.window.windowID == SDL_GetWindowID(window)) {
+            done = true;
+        }
+    };
+
     while (!done) {
         const auto frame_start = std::chrono::steady_clock::now();
         SDL_Event event;
-        while (SDL_PollEvent(&event) != 0) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
-            if (event.type == SDL_QUIT) {
-                done = true;
+
+        if (!force_redraw && !app_has_background_work(app)) {
+            if (SDL_WaitEventTimeout(&event, static_cast<int>(kIdleFrameInterval.count())) != 0) {
+                process_event(event);
+                while (SDL_PollEvent(&event) != 0) {
+                    process_event(event);
+                }
             }
-            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
-                event.window.windowID == SDL_GetWindowID(window)) {
-                done = true;
+        } else {
+            while (SDL_PollEvent(&event) != 0) {
+                process_event(event);
             }
         }
 
+        bool state_changed = false;
         for (auto &tab : app.tabs) {
-            poll_load(*tab);
-            poll_swmr_live(app, *tab);
+            state_changed = poll_load(*tab) || state_changed;
+            state_changed = poll_swmr_live(app, *tab) || state_changed;
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -2717,6 +2793,7 @@ int main(int argc, char **argv) {
 
         layout_windows(app);
 
+        const bool ui_fast_frames = imgui_wants_fast_frames(io);
         ImGui::Render();
         int display_w = 0;
         int display_h = 0;
@@ -2727,9 +2804,11 @@ int main(int argc, char **argv) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
 
+        const bool fast_frames = state_changed || app_has_background_work(app) || ui_fast_frames;
+        force_redraw = fast_frames;
         const auto frame_elapsed = std::chrono::steady_clock::now() - frame_start;
-        if (frame_elapsed < target_frame_duration) {
-            const auto delay_ms = std::chrono::duration_cast<std::chrono::milliseconds>(target_frame_duration - frame_elapsed);
+        if (fast_frames && frame_elapsed < kActiveFrameInterval) {
+            const auto delay_ms = std::chrono::duration_cast<std::chrono::milliseconds>(kActiveFrameInterval - frame_elapsed);
             if (delay_ms.count() > 0) {
                 SDL_Delay(static_cast<Uint32>(delay_ms.count()));
             }
