@@ -288,6 +288,17 @@ struct AppState {
     ImGuiID file_dock_id = 0;
     ImGuiID plot_dock_id = 0;
     int gl_max_texture_size = 4096;
+    bool show_performance_hud = false;
+    std::string gl_vendor;
+    std::string gl_renderer;
+    std::string gl_version;
+    std::string glsl_version;
+    double last_frame_ms = 0.0;
+    int last_event_count = 0;
+    bool last_used_idle_wait = false;
+    bool last_fast_frame = false;
+    bool last_background_work = false;
+    bool last_ui_active = false;
 };
 
 std::string trim(std::string s) {
@@ -2513,6 +2524,33 @@ void draw_file_picker(AppState &app) {
     ImGui::EndPopup();
 }
 
+void draw_performance_hud(AppState &app) {
+    if (!app.show_performance_hud) {
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Performance")) {
+        ImGui::End();
+        return;
+    }
+
+    const ImGuiIO &io = ImGui::GetIO();
+    ImGui::Text("Frame: %.2f ms (%.1f FPS)", app.last_frame_ms, io.Framerate);
+    ImGui::Text("Idle wait: %s", app.last_used_idle_wait ? "yes" : "no");
+    ImGui::Text("Fast frame: %s", app.last_fast_frame ? "yes" : "no");
+    ImGui::Text("Background work: %s", app.last_background_work ? "yes" : "no");
+    ImGui::Text("ImGui active item/mouse: %s", app.last_ui_active ? "yes" : "no");
+    ImGui::Text("SDL events last frame: %d", app.last_event_count);
+    ImGui::Separator();
+    ImGui::TextWrapped("GL vendor: %s", app.gl_vendor.c_str());
+    ImGui::TextWrapped("GL renderer: %s", app.gl_renderer.c_str());
+    ImGui::TextWrapped("GL version: %s", app.gl_version.c_str());
+    ImGui::TextWrapped("GLSL: %s", app.glsl_version.c_str());
+    ImGui::Text("Max texture size: %d", app.gl_max_texture_size);
+    ImGui::End();
+}
+
 void draw_file_tab_content(AppState &app, FileTab &tab) {
     ImGui::PushID(tab.id);
     draw_dataset_panel(app, tab);
@@ -2566,6 +2604,8 @@ void layout_windows(AppState &app) {
     ImGui::SameLine();
     ImGui::TextDisabled("%d file%s open", static_cast<int>(app.tabs.size()), app.tabs.size() == 1 ? "" : "s");
     ImGui::Checkbox("Show plot captions", &app.show_plot_captions);
+    ImGui::SameLine();
+    ImGui::Checkbox("Performance HUD", &app.show_performance_hud);
 
     if (app.tabs.empty()) {
         ImGui::Separator();
@@ -2621,6 +2661,7 @@ void layout_windows(AppState &app) {
     }
 
     draw_file_picker(app);
+    draw_performance_hud(app);
 }
 
 ImPlotColormap register_turbo_colormap() {
@@ -2683,6 +2724,11 @@ bool imgui_wants_fast_frames(const ImGuiIO &io) {
     return ImGui::IsAnyItemActive();
 }
 
+std::string gl_string(GLenum name) {
+    const GLubyte *value = glGetString(name);
+    return value == nullptr ? "unavailable" : reinterpret_cast<const char *>(value);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2735,6 +2781,10 @@ int main(int argc, char **argv) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     AppState app;
+    app.gl_vendor = gl_string(GL_VENDOR);
+    app.gl_renderer = gl_string(GL_RENDERER);
+    app.gl_version = gl_string(GL_VERSION);
+    app.glsl_version = gl_string(GL_SHADING_LANGUAGE_VERSION);
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &app.gl_max_texture_size);
     if (app.gl_max_texture_size <= 0) {
         app.gl_max_texture_size = 4096;
@@ -2767,16 +2817,22 @@ int main(int argc, char **argv) {
     while (!done) {
         const auto frame_start = std::chrono::steady_clock::now();
         SDL_Event event;
+        int event_count = 0;
+        bool used_idle_wait = false;
 
         if (!force_redraw && !app_has_background_work(app)) {
+            used_idle_wait = true;
             if (SDL_WaitEventTimeout(&event, static_cast<int>(kIdleFrameInterval.count())) != 0) {
+                ++event_count;
                 process_event(event);
                 while (SDL_PollEvent(&event) != 0) {
+                    ++event_count;
                     process_event(event);
                 }
             }
         } else {
             while (SDL_PollEvent(&event) != 0) {
+                ++event_count;
                 process_event(event);
             }
         }
@@ -2804,9 +2860,16 @@ int main(int argc, char **argv) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
 
-        const bool fast_frames = state_changed || app_has_background_work(app) || ui_fast_frames;
+        const bool background_work = app_has_background_work(app);
+        const bool fast_frames = state_changed || background_work || ui_fast_frames;
         force_redraw = fast_frames;
         const auto frame_elapsed = std::chrono::steady_clock::now() - frame_start;
+        app.last_frame_ms = std::chrono::duration<double, std::milli>(frame_elapsed).count();
+        app.last_event_count = event_count;
+        app.last_used_idle_wait = used_idle_wait;
+        app.last_fast_frame = fast_frames;
+        app.last_background_work = background_work;
+        app.last_ui_active = ui_fast_frames;
         if (fast_frames && frame_elapsed < kActiveFrameInterval) {
             const auto delay_ms = std::chrono::duration_cast<std::chrono::milliseconds>(kActiveFrameInterval - frame_elapsed);
             if (delay_ms.count() > 0) {
