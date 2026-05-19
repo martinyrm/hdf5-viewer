@@ -227,6 +227,13 @@ struct SwmrPollResult {
     std::string caption;
 };
 
+struct CommentPreviewResult {
+    int token = 0;
+    std::string path;
+    std::string caption;
+    std::string error;
+};
+
 struct LineCache {
     bool valid = false;
     const float *source_ptr = nullptr;
@@ -305,6 +312,13 @@ struct FilePicker {
     std::filesystem::path directory;
     std::array<char, 4096> selected_path{};
     std::string error;
+    int preview_token = 0;
+    bool preview_loading = false;
+    std::future<CommentPreviewResult> preview_future;
+    std::string preview_path;
+    std::string preview_caption;
+    std::string preview_error;
+    std::string pending_preview_path;
 };
 
 struct AppState {
@@ -712,6 +726,11 @@ struct VisitState {
     std::vector<DatasetInfo> *datasets = nullptr;
 };
 
+struct CommentVisitState {
+    hid_t file = -1;
+    std::vector<DatasetInfo> *comments = nullptr;
+};
+
 #if H5_VERSION_GE(1, 12, 0)
 herr_t visit_dataset(hid_t, const char *name, const H5O_info2_t *info, void *op_data) {
 #else
@@ -733,6 +752,31 @@ herr_t visit_dataset(hid_t, const char *name, const H5O_info_t *info, void *op_d
     return 0;
 }
 
+#if H5_VERSION_GE(1, 12, 0)
+herr_t visit_comment_dataset(hid_t, const char *name, const H5O_info2_t *info, void *op_data) {
+#else
+herr_t visit_comment_dataset(hid_t, const char *name, const H5O_info_t *info, void *op_data) {
+#endif
+    if (info == nullptr || info->type != H5O_TYPE_DATASET || name == nullptr || std::strcmp(name, ".") == 0) {
+        return 0;
+    }
+
+    const std::string open_path(name);
+    const std::string display_path = open_path.empty() || open_path[0] == '/' ? open_path : "/" + open_path;
+    const std::string dataset_name = lower_ascii(base_name(display_path));
+    if (dataset_name != "comment" && dataset_name != "comments") {
+        return 0;
+    }
+
+    auto *state = static_cast<CommentVisitState *>(op_data);
+    try {
+        state->comments->push_back(inspect_dataset(state->file, open_path, display_path));
+    } catch (...) {
+        return 0;
+    }
+    return 0;
+}
+
 std::vector<DatasetInfo> collect_file_index(hid_t file) {
     std::vector<DatasetInfo> datasets;
     VisitState state{file, &datasets};
@@ -748,6 +792,20 @@ std::vector<DatasetInfo> collect_file_index(hid_t file) {
         return lhs.path < rhs.path;
     });
     return datasets;
+}
+
+std::vector<DatasetInfo> collect_comment_index(hid_t file) {
+    std::vector<DatasetInfo> comments;
+    CommentVisitState state{file, &comments};
+#if H5_VERSION_GE(1, 12, 0)
+    H5Ovisit3(file, H5_INDEX_NAME, H5_ITER_NATIVE, visit_comment_dataset, &state, H5O_INFO_BASIC);
+#else
+    H5Ovisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, visit_comment_dataset, &state);
+#endif
+    std::sort(comments.begin(), comments.end(), [](const DatasetInfo &lhs, const DatasetInfo &rhs) {
+        return lhs.path < rhs.path;
+    });
+    return comments;
 }
 
 std::vector<DatasetInfo> load_file_index(const std::string &path, bool *opened_swmr = nullptr) {
@@ -999,6 +1057,17 @@ std::string load_comment_caption(const std::string &path, const std::vector<Data
         return {};
     }
     return collect_comment_caption(file.get(), datasets);
+}
+
+std::string load_file_comment_preview(const std::string &path) {
+    std::lock_guard<std::mutex> lock(g_hdf5_mutex);
+    H5File file(open_readonly_file(path));
+    if (!file.valid()) {
+        throw std::runtime_error("could not open HDF5 file");
+    }
+
+    std::vector<DatasetInfo> comments = collect_comment_index(file.get());
+    return collect_comment_caption(file.get(), comments);
 }
 
 void rebuild_dataset_tree(FileTab &tab) {
@@ -2792,6 +2861,95 @@ bool toggle_live_swmr(FileTab &tab) {
     return true;
 }
 
+CommentPreviewResult comment_preview_worker(int token, std::string path) {
+    CommentPreviewResult result;
+    result.token = token;
+    result.path = std::move(path);
+    try {
+        result.caption = trim(load_file_comment_preview(result.path));
+    } catch (const std::exception &ex) {
+        result.error = ex.what();
+    }
+    return result;
+}
+
+void start_comment_preview(FilePicker &picker, const std::string &path) {
+    const std::string ext = std::filesystem::path(path).extension().string();
+    if (path.empty() || (ext != ".h5" && ext != ".hdf5" && ext != ".H5" && ext != ".HDF5")) {
+        return;
+    }
+    if (path == picker.preview_path || path == picker.pending_preview_path) {
+        return;
+    }
+    if (picker.preview_loading) {
+        picker.pending_preview_path = path;
+        return;
+    }
+
+    picker.preview_path = path;
+    picker.preview_caption.clear();
+    picker.preview_error.clear();
+    picker.preview_loading = true;
+    const int token = ++picker.preview_token;
+    picker.preview_future = std::async(std::launch::async, comment_preview_worker, token, path);
+}
+
+void poll_comment_preview(FilePicker &picker) {
+    if (!picker.preview_loading || !picker.preview_future.valid()) {
+        if (!picker.pending_preview_path.empty()) {
+            const std::string pending = std::move(picker.pending_preview_path);
+            picker.pending_preview_path.clear();
+            start_comment_preview(picker, pending);
+        }
+        return;
+    }
+
+    using namespace std::chrono_literals;
+    if (picker.preview_future.wait_for(0ms) != std::future_status::ready) {
+        return;
+    }
+
+    CommentPreviewResult result = picker.preview_future.get();
+    picker.preview_loading = false;
+    if (result.token == picker.preview_token) {
+        picker.preview_path = std::move(result.path);
+        picker.preview_caption = std::move(result.caption);
+        picker.preview_error = std::move(result.error);
+    }
+    if (!picker.pending_preview_path.empty() && picker.pending_preview_path != picker.preview_path) {
+        const std::string pending = std::move(picker.pending_preview_path);
+        picker.pending_preview_path.clear();
+        start_comment_preview(picker, pending);
+    } else {
+        picker.pending_preview_path.clear();
+    }
+}
+
+void draw_comment_preview(const FilePicker &picker, const std::string &path, bool compact) {
+    if (path.empty()) {
+        return;
+    }
+
+    if (picker.preview_loading && (picker.preview_path == path || picker.pending_preview_path == path)) {
+        ImGui::TextDisabled("Comment preview loading...");
+        return;
+    }
+    if (picker.preview_path != path) {
+        return;
+    }
+    if (!picker.preview_caption.empty()) {
+        if (compact) {
+            ImGui::TextWrapped("%s", picker.preview_caption.c_str());
+        } else {
+            ImGui::TextWrapped("Comment: %s", picker.preview_caption.c_str());
+        }
+    } else if (!picker.preview_error.empty()) {
+        ImGui::TextDisabled("Comment preview unavailable: %s", picker.preview_error.c_str());
+    } else {
+        ImGui::TextDisabled("No comment field found.");
+    }
+}
+
 bool handle_keyboard_shortcuts(AppState &app) {
     ImGuiIO &io = ImGui::GetIO();
     const bool text_entry_active = io.WantTextInput || ImGui::IsAnyItemActive();
@@ -2831,6 +2989,7 @@ void draw_file_picker(AppState &app) {
         picker.visible = true;
         picker.request_open = false;
     }
+    poll_comment_preview(picker);
 
     if (!ImGui::BeginPopupModal("Open HDF5 file", &picker.visible, ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
@@ -2894,22 +3053,38 @@ void draw_file_picker(AppState &app) {
     }
     for (const auto &file : files) {
         const std::string label = file.path().filename().string();
+        const std::string file_path = file.path().string();
         if (ImGui::Selectable(label.c_str(), trim(picker.selected_path.data()) == file.path().string(),
                               ImGuiSelectableFlags_AllowDoubleClick)) {
-            copy_to_buffer(picker.selected_path, file.path().string());
+            copy_to_buffer(picker.selected_path, file_path);
+            start_comment_preview(picker, file_path);
         }
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            open_path_as_tab(app, file.path().string());
-            picker.visible = false;
-            ImGui::CloseCurrentPopup();
+        if (ImGui::IsItemHovered()) {
+            start_comment_preview(picker, file_path);
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(file_path.c_str());
+            ImGui::Separator();
+            draw_comment_preview(picker, file_path, true);
+            ImGui::EndTooltip();
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                open_path_as_tab(app, file_path);
+                picker.visible = false;
+                ImGui::CloseCurrentPopup();
+            }
         }
     }
     ImGui::EndChild();
 
+    const std::string selected_path = trim(picker.selected_path.data());
+    if (!selected_path.empty()) {
+        start_comment_preview(picker, selected_path);
+        ImGui::SeparatorText("Selected File Comment");
+        draw_comment_preview(picker, selected_path, false);
+    }
+
     if (ImGui::Button("Open Selected")) {
-        const std::string path = trim(picker.selected_path.data());
-        if (!path.empty()) {
-            open_path_as_tab(app, path);
+        if (!selected_path.empty()) {
+            open_path_as_tab(app, selected_path);
             picker.visible = false;
             ImGui::CloseCurrentPopup();
         }
