@@ -29,8 +29,22 @@ meson compile -C build
 ./build/hdf5_plotter stability_analyses/1777392253_delay_analysis.h5
 ```
 
+For regular lab use or distribution builds, prefer an optimized build:
+
+```sh
+meson setup build-release --buildtype=release
+meson compile -C build-release
+```
+
 If no file is passed, the app tries to open
 `stability_analyses/1777392253_delay_analysis.h5`.
+
+## Release Builds
+
+GitHub Actions builds release artifacts for macOS 26 arm64, macOS 26 Intel,
+Debian 12, and Debian 13 when a `v*` tag is pushed. See
+[`docs/releasing.md`](docs/releasing.md) for the runtime dependency lists and
+release workflow.
 
 ## Plot Behavior
 
@@ -43,28 +57,49 @@ If no file is passed, the app tries to open
   docked on the right; focus a plot to bring its matching file tab forward.
 - Use **Open File** for the built-in file picker, or edit the path in a tab and
   press **Reload**.
+- The file picker previews the first `comment` or `comments` dataset it finds
+  before opening a file. Hover over an HDF5 file for a tooltip preview, or select
+  it to show the preview caption below the file list.
+- Use **File Details** in a file tab to open optional HDF5 diagnostics,
+  including dataset layout, chunk shape, filters, storage size, and the current
+  2D texture-preview read plan.
+- Keyboard shortcuts are available when text fields are not active: `O`
+  opens the file picker, `Ctrl+O` / `Cmd+O` also opens it, `X` toggles Auto X,
+  `Y` toggles Auto Y, `F` flips X/Y for 2D datasets, and `Space` toggles live
+  SWMR refresh for the active tab.
+- The dataset browser shows HDF5 groups as a collapsible tree. Type in the
+  search box to switch to a flat, filtered result list when you already know a
+  dataset name.
 - Enable **Live SWMR refresh** in a file tab to poll an active SWMR writer and
   reload the selected plot when that dataset's extent changes.
 - **Show plot captions** is enabled by default and draws a small caption above
   each plot from the top-most string dataset named `comment` or `comments`.
+- **Performance HUD** shows frame timing, idle/active loop state, SDL event
+  counts, and the OpenGL vendor/renderer/version reported by the host.
 - Axis ranges are inferred from same-group 1D datasets when dimensions match,
   for example `freqs` for rows and `selected_spectrum_indices` or `timestamps`
   for columns.
 - The **X axis** selector can force index/column coordinates or replace them
   with any compatible 1D dataset in the same group.
+- Replacement X-axis datasets that are descending or otherwise not monotonic are
+  displayed in their original index order, with tick labels taken from the
+  source axis values rather than sorted into ascending order.
 - For 2D datasets, **Flip X/Y** transposes the display so rows are shown on X
   and columns on Y. The **Y axis** selector can also replace row coordinates
   with a compatible 1D dataset. Scalar HDF5 array datatypes, such as a
   fixed-length `Wavelengths` array, are treated as 1D numeric axis datasets.
-- The **Scaling** panel exposes auto/manual X and Y ranges for every plot, plus
-  auto/manual color limits for 2D datasets.
+- The **Scaling** panel exposes auto/manual X and Y ranges for every plot. For
+  2D datasets, color minimum and color maximum each have their own auto/manual
+  checkbox.
 - **Auto X** starts disabled after the initial data fit so mouse zooming and
   panning work immediately. Disable **Auto Y** to manually zoom Y as well; the
-  edited range fields stay linked to the current plot view.
+  edited range fields stay linked to the current plot view. Auto/manual scaling
+  choices are preserved across axis-definition changes and SWMR refreshes.
 - Unix timestamp-like X axes can be formatted as local date/time or UTC.
 - Line plots use a fixed high-contrast palette against the dark UI.
-- Dear ImGui is built with FreeType when `freetype2` is available, and the app
-  loads a platform TrueType font.
+- Dear ImGui is built with FreeType when `freetype2` is available. The app
+  loads a platform TrueType font and bakes the font atlas at the window's
+  framebuffer scale for sharper text on high-DPI displays.
 
 ## Performance Notes
 
@@ -74,14 +109,30 @@ If no file is passed, the app tries to open
 - SWMR refresh is opt-in and polls once per second. The poll checks metadata in
   SWMR read mode and only starts a full plot reload when the selected dataset
   shape changes. The previous plot remains visible while the refresh loads, and
-  the current X/Y/color ranges are preserved rather than re-autoscaled.
+  the current X/Y/color scaling choices are preserved.
 - Large 1D lines are cached as a viewport-aware min/max envelope, so zoomed-out
   views do not push millions of vertices through ImPlot each frame.
-- The render loop caps at about 60 FPS even when the platform OpenGL driver does
-  not provide vsync, avoiding runaway CPU usage while plots are idle.
+- The render loop is event-driven while idle: static plots wait for input or a
+  short idle tick instead of repainting continuously. Mouse interaction,
+  loading, and SWMR polling still use about 60 FPS pacing.
 - 2D datasets are sampled to a GPU texture capped by the current OpenGL maximum
   texture size and a conservative cell budget. Turbo color mapping is computed
   in parallel on CPU, then uploaded once as an RGBA texture and drawn with
   `ImPlot::PlotImage`.
+- CPU-side min/max and color conversion are capped to four worker threads by
+  default. Set `HDF5_PLOTTER_MAX_THREADS=1` for lowest CPU impact, or a larger
+  value for faster initial loading on workstation machines.
 - ImPlot itself is immediate-mode and CPU-driven for plot geometry. The main
   GPU acceleration here is texture-backed rendering for 2D datasets.
+
+Useful Linux checks:
+
+```sh
+glxinfo -B
+LIBGL_DEBUG=verbose ./build-release/hdf5_plotter your_file.h5
+perf top -p "$(pidof hdf5_plotter)"
+```
+
+In `glxinfo -B` or the app's **Performance HUD**, `llvmpipe` or `softpipe`
+means Mesa is using software rendering rather than the GPU. On NVIDIA systems,
+also check `nvidia-smi`; on Intel, `intel_gpu_top`; on AMD, `radeontop`.

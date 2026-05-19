@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  debian:
+    name: Debian ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    container: debian:${{ matrix.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "12"
+            codename: bookworm
+            hdf5_runtime: libhdf5-103-1
+          - version: "13"
+            codename: trixie
+            hdf5_runtime: libhdf5-310
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential \
+            git \
+            meson \
+            ninja-build \
+            pkg-config \
+            libsdl2-dev \
+            libhdf5-dev \
+            libgl1-mesa-dev \
+            libfreetype-dev \
+            fonts-dejavu-core \
+            xz-utils \
+            file
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0+${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          meson setup build-release --buildtype=release -Dstrip=true --prefix=/usr
+          meson compile -C build-release
+
+      - name: Package .deb
+        shell: bash
+        run: |
+          package="hdf5-imgui-plotter"
+          arch="amd64"
+          root="dist/${package}_${VERSION}_debian${{ matrix.version }}_${arch}"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/$package"
+          install -m 0755 build-release/hdf5_plotter "$root/usr/bin/hdf5_plotter"
+          install -m 0644 README.md "$root/usr/share/doc/$package/README.md"
+          cat > "$root/usr/share/doc/$package/RUNTIME-DEPS.txt" <<DEPS
+          Runtime dependencies for Debian ${{ matrix.version }} (${{ matrix.codename }}):
+            libc6
+            libstdc++6
+            libgcc-s1
+            libsdl2-2.0-0
+            libgl1
+            libfreetype6
+            fonts-dejavu-core
+            ${{ matrix.hdf5_runtime }}
+
+          A working OpenGL driver is required. On Mesa systems, install the
+          appropriate DRI driver package, usually libgl1-mesa-dri, or use the
+          vendor driver package for NVIDIA/AMD/Intel as appropriate.
+          DEPS
+          cat > "$root/DEBIAN/control" <<CONTROL
+          Package: $package
+          Version: $VERSION
+          Section: science
+          Priority: optional
+          Architecture: $arch
+          Maintainer: hdf5-imgui-plotter maintainers <noreply@example.com>
+          Depends: libc6, libstdc++6, libgcc-s1, libsdl2-2.0-0, libgl1, libfreetype6, fonts-dejavu-core, ${{ matrix.hdf5_runtime }}
+          Recommends: libgl1-mesa-dri
+          Description: HDF5 ImGui/ImPlot viewer
+           Desktop viewer for numeric HDF5 datasets using SDL2, OpenGL, Dear ImGui, and ImPlot.
+          CONTROL
+          dpkg-deb --build --root-owner-group "$root" "dist/${package}_${VERSION}_debian${{ matrix.version }}_${arch}.deb"
+          ldd build-release/hdf5_plotter > "dist/${package}_${VERSION}_debian${{ matrix.version }}_${arch}.ldd.txt"
+
+      - name: Upload Debian artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdf5-imgui-plotter-debian${{ matrix.version }}-amd64
+          path: |
+            dist/*.deb
+            dist/*.ldd.txt
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: x86_64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0+${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install meson ninja pkg-config sdl2 hdf5 freetype
+
+      - name: Build
+        run: |
+          meson setup build-release --buildtype=release -Dstrip=true
+          meson compile -C build-release
+
+      - name: Package .app
+        shell: bash
+        run: |
+          mkdir -p dist
+          bash scripts/package_macos_app.sh build-release/hdf5_plotter "dist/HDF5 ImPlot Viewer.app"
+          otool -L "dist/HDF5 ImPlot Viewer.app/Contents/MacOS/hdf5_plotter" > "dist/hdf5-imgui-plotter_${VERSION}_macos-${{ matrix.arch }}.otool.txt"
+          ditto -c -k --keepParent "dist/HDF5 ImPlot Viewer.app" "dist/hdf5-imgui-plotter_${VERSION}_macos-${{ matrix.arch }}.zip"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdf5-imgui-plotter-macos-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.otool.txt
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - debian
+      - macos
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
