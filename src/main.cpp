@@ -161,8 +161,10 @@ struct LoadedDataset {
 
     std::vector<float> line_values;
     std::vector<double> line_x_values;
+    std::vector<double> x_axis_label_values;
     hsize_t source_count = 0;
     hsize_t source_stride = 1;
+    bool x_axis_labels_from_values = false;
     bool x_values_increasing = true;
     bool x_values_decreasing = false;
     std::string x_source_path;
@@ -229,6 +231,12 @@ struct SwmrPollResult {
 
 struct CommentPreviewResult {
     int token = 0;
+    std::string path;
+    std::string caption;
+    std::string error;
+};
+
+struct CommentPreviewCacheEntry {
     std::string path;
     std::string caption;
     std::string error;
@@ -319,6 +327,7 @@ struct FilePicker {
     std::string preview_caption;
     std::string preview_error;
     std::string pending_preview_path;
+    std::vector<CommentPreviewCacheEntry> preview_cache;
 };
 
 struct AppState {
@@ -626,8 +635,22 @@ bool looks_like_unix_time_axis(const LoadedDataset &data) {
         contains_case_insensitive(label, "unix")) {
         return true;
     }
-    const double low = std::min(data.x_min, data.x_max);
-    const double high = std::max(data.x_min, data.x_max);
+    double low = std::min(data.x_min, data.x_max);
+    double high = std::max(data.x_min, data.x_max);
+    if (!data.x_axis_label_values.empty()) {
+        double label_min = std::numeric_limits<double>::infinity();
+        double label_max = -std::numeric_limits<double>::infinity();
+        for (double value : data.x_axis_label_values) {
+            if (std::isfinite(value)) {
+                label_min = std::min(label_min, value);
+                label_max = std::max(label_max, value);
+            }
+        }
+        if (std::isfinite(label_min) && std::isfinite(label_max)) {
+            low = label_min;
+            high = label_max;
+        }
+    }
     return low > 946684800.0 && high < 4102444800.0;
 }
 
@@ -644,6 +667,53 @@ int unix_time_formatter(double value, char *buffer, int size, void *user_data) {
     char time_buffer[64] = {};
     std::strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", &tm_value);
     return std::snprintf(buffer, static_cast<size_t>(size), "%s", time_buffer);
+}
+
+struct AxisValueFormatterData {
+    const LoadedDataset *data = nullptr;
+    bool datetime = false;
+    bool utc = false;
+};
+
+double index_ordered_axis_value(const LoadedDataset &data, double coordinate) {
+    const std::vector<double> &values = data.x_axis_label_values;
+    if (values.empty()) {
+        return coordinate;
+    }
+    if (values.size() == 1 || data.x_max == data.x_min) {
+        return values.front();
+    }
+
+    const double t = (coordinate - data.x_min) / (data.x_max - data.x_min);
+    const double clamped = std::clamp(std::isfinite(t) ? t : 0.0, 0.0, 1.0);
+    const size_t index = static_cast<size_t>(std::llround(clamped * static_cast<double>(values.size() - 1)));
+    return values[std::min(index, values.size() - 1)];
+}
+
+int index_ordered_axis_formatter(double value, char *buffer, int size, void *user_data) {
+    const auto *formatter = static_cast<const AxisValueFormatterData *>(user_data);
+    if (formatter == nullptr || formatter->data == nullptr) {
+        return std::snprintf(buffer, static_cast<size_t>(size), "%.6g", value);
+    }
+
+    const double label_value = index_ordered_axis_value(*formatter->data, value);
+    if (formatter->datetime) {
+        bool utc = formatter->utc;
+        return unix_time_formatter(label_value, buffer, size, &utc);
+    }
+    return std::snprintf(buffer, static_cast<size_t>(size), "%.6g", label_value);
+}
+
+void setup_x_axis_format(FileTab &tab, const LoadedDataset &data, AxisValueFormatterData &formatter) {
+    const bool datetime = tab.x_datetime && looks_like_unix_time_axis(data);
+    if (data.x_axis_labels_from_values && !data.x_axis_label_values.empty()) {
+        formatter.data = &data;
+        formatter.datetime = datetime;
+        formatter.utc = tab.x_datetime_utc;
+        ImPlot::SetupAxisFormat(ImAxis_X1, index_ordered_axis_formatter, &formatter);
+    } else if (datetime) {
+        ImPlot::SetupAxisFormat(ImAxis_X1, unix_time_formatter, &tab.x_datetime_utc);
+    }
 }
 
 bool preferred_name(const std::string &name, const std::vector<std::string> &preferred) {
@@ -1676,17 +1746,24 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
             result.data->value_max = max_value;
             result.data->y_label = base_name(info.path);
             if (has_x_axis_info && !x_axis.path.empty()) {
-                result.data->line_x_values = read_1d_dataset_double(file_path, x_axis_info, stride);
-                if (result.data->line_x_values.size() == result.data->line_values.size()) {
-                    auto [x_min, x_max] = finite_minmax(result.data->line_x_values);
-                    result.data->x_min = x_min;
-                    result.data->x_max = x_max;
+                std::vector<double> x_values = read_1d_dataset_double(file_path, x_axis_info, stride);
+                if (x_values.size() == result.data->line_values.size()) {
                     result.data->x_label = x_axis.label;
                     result.data->x_source_path = x_axis.path;
-                    result.data->x_values_increasing = is_monotonic_increasing(result.data->line_x_values);
-                    result.data->x_values_decreasing = is_monotonic_decreasing(result.data->line_x_values);
+                    result.data->x_values_increasing = is_monotonic_increasing(x_values);
+                    result.data->x_values_decreasing = is_monotonic_decreasing(x_values);
+                    if (result.data->x_values_increasing) {
+                        auto [x_min, x_max] = finite_minmax(x_values);
+                        result.data->x_min = x_min;
+                        result.data->x_max = x_max;
+                        result.data->line_x_values = std::move(x_values);
+                    } else {
+                        result.data->x_min = 0.0;
+                        result.data->x_max = source_count > 1 ? static_cast<double>(source_count - 1) : 0.0;
+                        result.data->x_axis_labels_from_values = true;
+                        result.data->x_axis_label_values = std::move(x_values);
+                    }
                 } else {
-                    result.data->line_x_values.clear();
                     apply_axis_range(file_path, x_axis, 0.0, static_cast<double>(source_count - 1), "index",
                                      result.data->x_min, result.data->x_max, result.data->x_label);
                 }
@@ -1737,8 +1814,25 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
             result.data->value_max = max_value;
             result.data->applied_color_min = min_value;
             result.data->applied_color_max = max_value;
-            apply_axis_range(file_path, x_axis, 0.0, static_cast<double>(config.x_fallback_count - 1),
-                             config.x_fallback_label, result.data->x_min, result.data->x_max, result.data->x_label);
+            bool applied_index_ordered_x_labels = false;
+            if (has_x_axis_info && !x_axis.path.empty()) {
+                const hsize_t x_axis_stride = config.transpose_2d ? plan.row_stride : plan.col_stride;
+                std::vector<double> x_values = read_1d_dataset_double(file_path, x_axis_info, x_axis_stride);
+                if (x_values.size() == static_cast<size_t>(texture_cols) && !is_monotonic_increasing(x_values)) {
+                    result.data->x_min = 0.0;
+                    result.data->x_max =
+                        config.x_fallback_count > 1 ? static_cast<double>(config.x_fallback_count - 1) : 0.0;
+                    result.data->x_label = x_axis.label;
+                    result.data->x_source_path = x_axis.path;
+                    result.data->x_axis_labels_from_values = true;
+                    result.data->x_axis_label_values = std::move(x_values);
+                    applied_index_ordered_x_labels = true;
+                }
+            }
+            if (!applied_index_ordered_x_labels) {
+                apply_axis_range(file_path, x_axis, 0.0, static_cast<double>(config.x_fallback_count - 1),
+                                 config.x_fallback_label, result.data->x_min, result.data->x_max, result.data->x_label);
+            }
             apply_axis_range(file_path, y_axis, 0.0, static_cast<double>(config.y_fallback_count - 1),
                              config.y_fallback_label, result.data->y_min, result.data->y_max, result.data->y_label);
             if (plan.row_stride > 1 || plan.col_stride > 1) {
@@ -1903,14 +1997,11 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
     }
     DatasetInfo x_axis_info;
     bool has_x_axis_info = false;
-    if (info.dims.size() == 1 && tab.x_axis_index >= 0 && tab.x_axis_index < static_cast<int>(tab.datasets.size())) {
-        x_axis_info = tab.datasets[static_cast<size_t>(tab.x_axis_index)];
-        has_x_axis_info = true;
-    } else if (info.dims.size() == 1 && tab.x_axis_index == -2 && !x_axis.path.empty()) {
+    if (!x_axis.path.empty()) {
         auto it = std::find_if(tab.datasets.begin(), tab.datasets.end(), [&](const DatasetInfo &candidate) {
             return candidate.path == x_axis.path;
         });
-        if (it != tab.datasets.end()) {
+        if (it != tab.datasets.end() && vector_axis_length(*it) == x_fallback_count) {
             x_axis_info = *it;
             has_x_axis_info = true;
         }
@@ -2687,9 +2778,8 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
         }
         if (ImPlot::BeginPlot("##line", ImVec2(-1, -1))) {
             ImPlot::SetupAxes(data.x_label.c_str(), data.y_label.c_str());
-            if (tab.x_datetime && looks_like_unix_time_axis(data)) {
-                ImPlot::SetupAxisFormat(ImAxis_X1, unix_time_formatter, &tab.x_datetime_utc);
-            }
+            AxisValueFormatterData x_formatter;
+            setup_x_axis_format(tab, data, x_formatter);
             const ImPlotRect limits = ImPlot::GetPlotLimits();
             const double cache_min = tab.controls.x.automatic ? data.x_min : limits.X.Min;
             const double cache_max = tab.controls.x.automatic ? data.x_max : limits.X.Max;
@@ -2725,9 +2815,8 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
 
         if (tab.heat_texture != 0 && ImPlot::BeginPlot("##heatmap", ImVec2(-1, -1))) {
             ImPlot::SetupAxes(data.x_label.c_str(), data.y_label.c_str());
-            if (tab.x_datetime && looks_like_unix_time_axis(data)) {
-                ImPlot::SetupAxisFormat(ImAxis_X1, unix_time_formatter, &tab.x_datetime_utc);
-            }
+            AxisValueFormatterData x_formatter;
+            setup_x_axis_format(tab, data, x_formatter);
             ImPlot::PlotImage(base_name(data.info.path).c_str(), reinterpret_cast<ImTextureID>(static_cast<intptr_t>(tab.heat_texture)),
                               ImPlotPoint(data.x_min, data.y_min), ImPlotPoint(data.x_max, data.y_max), ImVec2(0, 0),
                               ImVec2(1, 1));
@@ -2873,9 +2962,26 @@ CommentPreviewResult comment_preview_worker(int token, std::string path) {
     return result;
 }
 
+CommentPreviewCacheEntry *find_comment_preview(FilePicker &picker, const std::string &path) {
+    auto found = std::find_if(picker.preview_cache.begin(), picker.preview_cache.end(), [&](const CommentPreviewCacheEntry &entry) {
+        return entry.path == path;
+    });
+    return found == picker.preview_cache.end() ? nullptr : &(*found);
+}
+
+const CommentPreviewCacheEntry *find_comment_preview(const FilePicker &picker, const std::string &path) {
+    auto found = std::find_if(picker.preview_cache.begin(), picker.preview_cache.end(), [&](const CommentPreviewCacheEntry &entry) {
+        return entry.path == path;
+    });
+    return found == picker.preview_cache.end() ? nullptr : &(*found);
+}
+
 void start_comment_preview(FilePicker &picker, const std::string &path) {
     const std::string ext = std::filesystem::path(path).extension().string();
     if (path.empty() || (ext != ".h5" && ext != ".hdf5" && ext != ".H5" && ext != ".HDF5")) {
+        return;
+    }
+    if (find_comment_preview(picker, path) != nullptr) {
         return;
     }
     if (path == picker.preview_path || path == picker.pending_preview_path) {
@@ -2915,6 +3021,16 @@ void poll_comment_preview(FilePicker &picker) {
         picker.preview_path = std::move(result.path);
         picker.preview_caption = std::move(result.caption);
         picker.preview_error = std::move(result.error);
+        CommentPreviewCacheEntry *entry = find_comment_preview(picker, picker.preview_path);
+        if (entry == nullptr) {
+            picker.preview_cache.push_back(CommentPreviewCacheEntry{picker.preview_path, picker.preview_caption, picker.preview_error});
+            if (picker.preview_cache.size() > 64) {
+                picker.preview_cache.erase(picker.preview_cache.begin());
+            }
+        } else {
+            entry->caption = picker.preview_caption;
+            entry->error = picker.preview_error;
+        }
     }
     if (!picker.pending_preview_path.empty() && picker.pending_preview_path != picker.preview_path) {
         const std::string pending = std::move(picker.pending_preview_path);
@@ -2927,6 +3043,22 @@ void poll_comment_preview(FilePicker &picker) {
 
 void draw_comment_preview(const FilePicker &picker, const std::string &path, bool compact) {
     if (path.empty()) {
+        return;
+    }
+
+    const CommentPreviewCacheEntry *entry = find_comment_preview(picker, path);
+    if (entry != nullptr) {
+        if (!entry->caption.empty()) {
+            if (compact) {
+                ImGui::TextWrapped("%s", entry->caption.c_str());
+            } else {
+                ImGui::TextWrapped("Comment: %s", entry->caption.c_str());
+            }
+        } else if (!entry->error.empty()) {
+            ImGui::TextDisabled("Comment preview unavailable: %s", entry->error.c_str());
+        } else {
+            ImGui::TextDisabled("No comment field found.");
+        }
         return;
     }
 
