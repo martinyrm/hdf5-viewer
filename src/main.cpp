@@ -658,10 +658,14 @@ int unix_time_formatter(double value, char *buffer, int size, void *user_data) {
     const bool utc = user_data != nullptr && *static_cast<bool *>(user_data);
     const std::time_t seconds = static_cast<std::time_t>(std::llround(value));
     std::tm tm_value{};
-    if (utc) {
-        gmtime_r(&seconds, &tm_value);
-    } else {
-        localtime_r(&seconds, &tm_value);
+    bool ok = false;
+#if defined(_WIN32)
+    ok = utc ? gmtime_s(&tm_value, &seconds) == 0 : localtime_s(&tm_value, &seconds) == 0;
+#else
+    ok = utc ? gmtime_r(&seconds, &tm_value) != nullptr : localtime_r(&seconds, &tm_value) != nullptr;
+#endif
+    if (!ok) {
+        return std::snprintf(buffer, static_cast<size_t>(size), "%.0f", value);
     }
 
     char time_buffer[64] = {};
@@ -3572,7 +3576,10 @@ float framebuffer_font_scale(SDL_Window *window) {
 }
 
 void load_ui_font(ImGuiIO &io, float framebuffer_scale) {
-    static const std::array<const char *, 6> candidates = {
+    static const std::array<const char *, 9> candidates = {
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\verdana.ttf",
         "/System/Library/Fonts/Supplemental/Verdana.ttf",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",

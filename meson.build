@@ -14,8 +14,12 @@ cpp = meson.get_compiler('cpp')
 threads_dep = dependency('threads')
 sdl2_dep = dependency('sdl2')
 opengl_dep = dependency('opengl', required: false)
-if not opengl_dep.found() and host_machine.system() == 'darwin'
-  opengl_dep = dependency('appleframeworks', modules: ['OpenGL'])
+if not opengl_dep.found()
+  if host_machine.system() == 'darwin'
+    opengl_dep = dependency('appleframeworks', modules: ['OpenGL'])
+  elif host_machine.system() == 'windows'
+    opengl_dep = cpp.find_library('opengl32')
+  endif
 endif
 
 hdf5_dep = dependency('hdf5', method: 'pkg-config', required: false)
@@ -23,7 +27,7 @@ if not hdf5_dep.found()
   hdf5_dep = dependency('hdf5-serial', method: 'pkg-config', required: false)
 endif
 if not hdf5_dep.found()
-  error('HDF5 was not found. Install hdf5 with Homebrew on macOS, or libhdf5-dev on Debian.')
+  error('HDF5 was not found. Install hdf5 with Homebrew on macOS, libhdf5-dev on Debian, or mingw-w64-ucrt-x86_64-hdf5 on Windows/MSYS2.')
 endif
 
 imgui_dep = dependency('imgui', fallback: ['imgui', 'imgui_dep'])

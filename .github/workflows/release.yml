@@ -159,12 +159,74 @@ jobs:
             dist/*.zip
             dist/*.otool.txt
 
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Configure Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-hdf5
+            mingw-w64-ucrt-x86_64-freetype
+
+      - name: Set version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0+${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          meson setup build-release --buildtype=release -Dstrip=true
+          meson compile -C build-release
+
+      - name: Package Windows zip
+        run: |
+          mkdir -p dist
+          package_dir="dist/hdf5-imgui-plotter_${VERSION}_windows-x86_64"
+          bash scripts/package_windows_msys2.sh build-release/hdf5_plotter.exe "$package_dir"
+          ldd build-release/hdf5_plotter.exe > "dist/hdf5-imgui-plotter_${VERSION}_windows-x86_64.ldd.txt"
+          (cd dist && zip -r "hdf5-imgui-plotter_${VERSION}_windows-x86_64.zip" "hdf5-imgui-plotter_${VERSION}_windows-x86_64")
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdf5-imgui-plotter-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.ldd.txt
+
   publish:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - debian
       - macos
+      - windows
     runs-on: ubuntu-24.04
     steps:
       - name: Download release artifacts

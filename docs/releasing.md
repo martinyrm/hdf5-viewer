@@ -5,6 +5,7 @@ workflow produces:
 
 - `hdf5-imgui-plotter_<version>_macos-arm64.zip`
 - `hdf5-imgui-plotter_<version>_macos-x86_64.zip`
+- `hdf5-imgui-plotter_<version>_windows-x86_64.zip`
 - `hdf5-imgui-plotter_<version>_debian12_amd64.deb`
 - `hdf5-imgui-plotter_<version>_debian13_amd64.deb`
 
@@ -41,6 +42,14 @@ sudo apt install libgl1-mesa-dri
 Vendor NVIDIA/AMD/Intel packages may replace or supplement the Mesa driver
 stack on lab machines with dedicated GPUs.
 
+Windows:
+
+The Windows zip is built with MSYS2 UCRT64 and includes the required MinGW DLLs
+next to `hdf5_plotter.exe`, including SDL2, HDF5, FreeType, libstdc++, libgcc,
+winpthread, zlib, libpng, and transitive runtime DLLs. Users should unzip the
+whole folder and run `hdf5_plotter.exe` from inside it. No MSYS2 installation is
+needed on the target machine, but Windows must have a working OpenGL driver.
+
 ## Publishing A Release
 
 1. Update `meson.build`'s project version if the release should carry a new
@@ -54,7 +63,7 @@ stack on lab machines with dedicated GPUs.
    ```
 
 4. The **Release** workflow builds on GitHub-hosted macOS 26 arm64,
-   macOS 26 Intel, Debian 12, and Debian 13 runners.
+   macOS 26 Intel, Windows Server 2025, Debian 12, and Debian 13 runners.
 5. When all build jobs pass, the workflow creates a GitHub Release and attaches
    the zip/deb artifacts plus linker diagnostic text files.
 

@@ -17,6 +17,12 @@ Debian 12/13:
 sudo apt install build-essential git meson ninja-build pkg-config libsdl2-dev libhdf5-dev libgl1-mesa-dev libfreetype-dev fonts-dejavu-core
 ```
 
+Windows with MSYS2 UCRT64:
+
+```sh
+pacman -S --needed git zip mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-SDL2 mingw-w64-ucrt-x86_64-hdf5 mingw-w64-ucrt-x86_64-freetype
+```
+
 Dear ImGui and ImPlot are pinned as Meson wrap subprojects and are downloaded
 on the first `meson setup`. ImGui uses the `v1.90.9-docking` branch tag so the
 app can use Dear ImGui docking with the ImPlot 0.16 API.
@@ -42,7 +48,7 @@ If no file is passed, the app tries to open
 ## Release Builds
 
 GitHub Actions builds release artifacts for macOS 26 arm64, macOS 26 Intel,
-Debian 12, and Debian 13 when a `v*` tag is pushed. See
+Windows x86_64, Debian 12, and Debian 13 when a `v*` tag is pushed. See
 [`docs/releasing.md`](docs/releasing.md) for the runtime dependency lists and
 release workflow.
 
