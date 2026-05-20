@@ -196,6 +196,7 @@ struct LoadConfig {
     int max_texture_side = 4096;
     size_t max_texture_cells = 12000000;
     bool transpose_2d = false;
+    bool sort_x_axis_increasing = false;
     hsize_t x_fallback_count = 0;
     hsize_t y_fallback_count = 0;
     std::string x_fallback_label = "column";
@@ -286,6 +287,7 @@ struct FileTab {
     int x_axis_index = -2; // -2 auto, -1 indices, >=0 dataset index
     int y_axis_index = -2; // 2D only: -2 auto, -1 row/column indices, >=0 dataset index
     bool transpose_2d = false;
+    bool sort_x_axis_increasing = false;
     bool x_datetime = false;
     bool x_datetime_utc = false;
     bool show_file_details = false;
@@ -1573,6 +1575,55 @@ std::vector<float> transpose_2d_values(const std::vector<float> &values, hsize_t
     return transposed;
 }
 
+std::vector<size_t> ascending_axis_permutation(const std::vector<double> &values) {
+    std::vector<size_t> order(values.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        const double lhs_value = values[lhs];
+        const double rhs_value = values[rhs];
+        const bool lhs_finite = std::isfinite(lhs_value);
+        const bool rhs_finite = std::isfinite(rhs_value);
+        if (lhs_finite != rhs_finite) {
+            return lhs_finite;
+        }
+        if (!lhs_finite && !rhs_finite) {
+            return lhs < rhs;
+        }
+        if (lhs_value == rhs_value) {
+            return lhs < rhs;
+        }
+        return lhs_value < rhs_value;
+    });
+    return order;
+}
+
+template <typename T> std::vector<T> reordered_by_permutation(const std::vector<T> &values, const std::vector<size_t> &order) {
+    std::vector<T> reordered(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        reordered[i] = values[order[i]];
+    }
+    return reordered;
+}
+
+std::vector<float> reorder_2d_columns(const std::vector<float> &values, hsize_t rows, hsize_t cols,
+                                      const std::vector<size_t> &order) {
+    const size_t row_count = static_cast<size_t>(rows);
+    const size_t col_count = static_cast<size_t>(cols);
+    if (order.size() != col_count || values.size() != row_count * col_count) {
+        return values;
+    }
+
+    std::vector<float> reordered(values.size());
+    parallel_for(row_count, [&](size_t begin, size_t end) {
+        for (size_t row = begin; row < end; ++row) {
+            for (size_t col = 0; col < col_count; ++col) {
+                reordered[row * col_count + col] = values[row * col_count + order[col]];
+            }
+        }
+    });
+    return reordered;
+}
+
 AxisSpec find_axis(const std::vector<DatasetInfo> &datasets, const DatasetInfo &target, hsize_t dim,
                    const std::vector<std::string> &preferred) {
     const std::string group = group_name(target.path);
@@ -1754,9 +1805,14 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
                 if (x_values.size() == result.data->line_values.size()) {
                     result.data->x_label = x_axis.label;
                     result.data->x_source_path = x_axis.path;
+                    if (config.sort_x_axis_increasing) {
+                        const std::vector<size_t> order = ascending_axis_permutation(x_values);
+                        result.data->line_values = reordered_by_permutation(result.data->line_values, order);
+                        x_values = reordered_by_permutation(x_values, order);
+                    }
                     result.data->x_values_increasing = is_monotonic_increasing(x_values);
                     result.data->x_values_decreasing = is_monotonic_decreasing(x_values);
-                    if (result.data->x_values_increasing) {
+                    if (config.sort_x_axis_increasing || result.data->x_values_increasing) {
                         auto [x_min, x_max] = finite_minmax(x_values);
                         result.data->x_min = x_min;
                         result.data->x_max = x_max;
@@ -1800,6 +1856,31 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
                 texture_rows = cols;
                 texture_cols = rows;
             }
+            bool applied_x_axis_values = false;
+            if (has_x_axis_info && !x_axis.path.empty()) {
+                const hsize_t x_axis_stride = config.transpose_2d ? plan.row_stride : plan.col_stride;
+                std::vector<double> x_values = read_1d_dataset_double(file_path, x_axis_info, x_axis_stride);
+                if (x_values.size() == static_cast<size_t>(texture_cols)) {
+                    result.data->x_label = x_axis.label;
+                    result.data->x_source_path = x_axis.path;
+                    if (config.sort_x_axis_increasing) {
+                        const std::vector<size_t> order = ascending_axis_permutation(x_values);
+                        values = reorder_2d_columns(values, texture_rows, texture_cols, order);
+                        x_values = reordered_by_permutation(x_values, order);
+                        auto [x_min, x_max] = finite_minmax(x_values);
+                        result.data->x_min = x_min;
+                        result.data->x_max = x_max;
+                        applied_x_axis_values = true;
+                    } else if (!is_monotonic_increasing(x_values)) {
+                        result.data->x_min = 0.0;
+                        result.data->x_max =
+                            config.x_fallback_count > 1 ? static_cast<double>(config.x_fallback_count - 1) : 0.0;
+                        result.data->x_axis_labels_from_values = true;
+                        result.data->x_axis_label_values = std::move(x_values);
+                        applied_x_axis_values = true;
+                    }
+                }
+            }
             const auto minmax = finite_minmax(values);
             const float min_value = minmax.first;
             const float max_value = minmax.second;
@@ -1818,22 +1899,7 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
             result.data->value_max = max_value;
             result.data->applied_color_min = min_value;
             result.data->applied_color_max = max_value;
-            bool applied_index_ordered_x_labels = false;
-            if (has_x_axis_info && !x_axis.path.empty()) {
-                const hsize_t x_axis_stride = config.transpose_2d ? plan.row_stride : plan.col_stride;
-                std::vector<double> x_values = read_1d_dataset_double(file_path, x_axis_info, x_axis_stride);
-                if (x_values.size() == static_cast<size_t>(texture_cols) && !is_monotonic_increasing(x_values)) {
-                    result.data->x_min = 0.0;
-                    result.data->x_max =
-                        config.x_fallback_count > 1 ? static_cast<double>(config.x_fallback_count - 1) : 0.0;
-                    result.data->x_label = x_axis.label;
-                    result.data->x_source_path = x_axis.path;
-                    result.data->x_axis_labels_from_values = true;
-                    result.data->x_axis_label_values = std::move(x_values);
-                    applied_index_ordered_x_labels = true;
-                }
-            }
-            if (!applied_index_ordered_x_labels) {
+            if (!applied_x_axis_values) {
                 apply_axis_range(file_path, x_axis, 0.0, static_cast<double>(config.x_fallback_count - 1),
                                  config.x_fallback_label, result.data->x_min, result.data->x_max, result.data->x_label);
             }
@@ -1969,6 +2035,7 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
     if (tab.selected_index != index || !keep_axis_choice) {
         tab.x_axis_index = -2;
         tab.y_axis_index = -2;
+        tab.sort_x_axis_increasing = false;
     }
     tab.selected_index = index;
     if (preserve_controls) {
@@ -2015,6 +2082,7 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
     LoadConfig config;
     config.max_texture_side = std::max(256, std::min(app.gl_max_texture_size, 4096));
     config.transpose_2d = info.dims.size() == 2 && tab.transpose_2d;
+    config.sort_x_axis_increasing = tab.sort_x_axis_increasing;
     config.x_fallback_count = x_fallback_count;
     config.y_fallback_count = y_fallback_count;
     config.x_fallback_label = std::move(x_fallback_label);
@@ -2566,9 +2634,30 @@ void draw_axis_selector(AppState &app, FileTab &tab) {
             ImGui::SetTooltip("Transpose 2D datasets so rows are shown on X and columns on Y.");
         }
     }
+    const AxisGuess guessed_axes = guess_axes(tab.datasets, target);
+    AxisSpec active_x_axis;
+    if (target.dims.size() == 1) {
+        active_x_axis = selected_axis(tab.datasets, tab.x_axis_index, target.dims[0], guessed_axes.x);
+    } else if (target.dims.size() == 2) {
+        const bool transposed = tab.transpose_2d;
+        active_x_axis = selected_axis(tab.datasets, tab.x_axis_index, target.dims[transposed ? 0 : 1],
+                                      transposed ? guessed_axes.y : guessed_axes.x);
+    }
+
     const std::vector<int> compatible_x = compatible_x_axis_indices(tab.datasets, target, tab.transpose_2d);
     draw_axis_combo(app, tab, "X axis", tab.x_axis_index, compatible_x,
                     target.dims.size() == 1 ? "Index" : tab.transpose_2d ? "Row" : "Column");
+    const bool has_x_axis_values = !active_x_axis.path.empty();
+    ImGui::BeginDisabled(!has_x_axis_values);
+    bool sort_x_axis = tab.sort_x_axis_increasing;
+    if (ImGui::Checkbox("Sort X ascending", &sort_x_axis)) {
+        tab.sort_x_axis_increasing = sort_x_axis;
+        start_load(app, tab, tab.selected_index, true, false, true);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Sort the selected X-axis values into increasing order and reorder plotted samples or columns to match. Leave off to preserve file index order.");
+    }
+    ImGui::EndDisabled();
     if (target.dims.size() == 2) {
         const std::vector<int> compatible_y = compatible_y_axis_indices(tab.datasets, target, tab.transpose_2d);
         draw_axis_combo(app, tab, "Y axis", tab.y_axis_index, compatible_y, tab.transpose_2d ? "Column" : "Row");
