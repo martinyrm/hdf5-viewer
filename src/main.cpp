@@ -2593,18 +2593,18 @@ void draw_axis_combo(AppState &app, FileTab &tab, const char *label, int &axis_i
     if (ImGui::BeginCombo(label, preview.c_str())) {
         if (ImGui::Selectable("Auto", axis_index == -2)) {
             axis_index = -2;
-            start_load(app, tab, tab.selected_index, true, false, true);
+            start_load(app, tab, tab.selected_index, true, true, true);
         }
         if (ImGui::Selectable(index_label, axis_index == -1)) {
             axis_index = -1;
-            start_load(app, tab, tab.selected_index, true, false, true);
+            start_load(app, tab, tab.selected_index, true, true, true);
         }
         ImGui::Separator();
         for (int candidate_index : compatible) {
             const DatasetInfo &axis = tab.datasets[static_cast<size_t>(candidate_index)];
             if (ImGui::Selectable(axis.path.c_str(), axis_index == candidate_index)) {
                 axis_index = candidate_index;
-                start_load(app, tab, tab.selected_index, true, false, true);
+                start_load(app, tab, tab.selected_index, true, true, true);
             }
         }
         ImGui::EndCombo();
@@ -2628,13 +2628,16 @@ void draw_axis_selector(AppState &app, FileTab &tab) {
             tab.transpose_2d = transpose;
             tab.x_axis_index = -2;
             tab.y_axis_index = -2;
-            start_load(app, tab, tab.selected_index, true, false, true);
+            start_load(app, tab, tab.selected_index, true, true, true);
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Transpose 2D datasets so rows are shown on X and columns on Y.");
         }
     }
     const AxisGuess guessed_axes = guess_axes(tab.datasets, target);
+    const std::vector<int> compatible_x = compatible_x_axis_indices(tab.datasets, target, tab.transpose_2d);
+    draw_axis_combo(app, tab, "X axis", tab.x_axis_index, compatible_x,
+                    target.dims.size() == 1 ? "Index" : tab.transpose_2d ? "Row" : "Column");
     AxisSpec active_x_axis;
     if (target.dims.size() == 1) {
         active_x_axis = selected_axis(tab.datasets, tab.x_axis_index, target.dims[0], guessed_axes.x);
@@ -2643,16 +2646,12 @@ void draw_axis_selector(AppState &app, FileTab &tab) {
         active_x_axis = selected_axis(tab.datasets, tab.x_axis_index, target.dims[transposed ? 0 : 1],
                                       transposed ? guessed_axes.y : guessed_axes.x);
     }
-
-    const std::vector<int> compatible_x = compatible_x_axis_indices(tab.datasets, target, tab.transpose_2d);
-    draw_axis_combo(app, tab, "X axis", tab.x_axis_index, compatible_x,
-                    target.dims.size() == 1 ? "Index" : tab.transpose_2d ? "Row" : "Column");
     const bool has_x_axis_values = !active_x_axis.path.empty();
     ImGui::BeginDisabled(!has_x_axis_values);
     bool sort_x_axis = tab.sort_x_axis_increasing;
     if (ImGui::Checkbox("Sort X ascending", &sort_x_axis)) {
         tab.sort_x_axis_increasing = sort_x_axis;
-        start_load(app, tab, tab.selected_index, true, false, true);
+        start_load(app, tab, tab.selected_index, true, true, true);
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Sort the selected X-axis values into increasing order and reorder plotted samples or columns to match. Leave off to preserve file index order.");
@@ -2911,8 +2910,8 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
             AxisValueFormatterData x_formatter;
             setup_x_axis_format(tab, data, x_formatter);
             ImPlot::PlotImage(base_name(data.info.path).c_str(), reinterpret_cast<ImTextureID>(static_cast<intptr_t>(tab.heat_texture)),
-                              ImPlotPoint(data.x_min, data.y_min), ImPlotPoint(data.x_max, data.y_max), ImVec2(0, 0),
-                              ImVec2(1, 1));
+                              ImPlotPoint(data.x_min, data.y_min), ImPlotPoint(data.x_max, data.y_max), ImVec2(0, 1),
+                              ImVec2(1, 0));
             ImPlot::EndPlot();
         }
     }

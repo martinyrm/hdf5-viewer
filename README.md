@@ -90,6 +90,9 @@ release workflow.
 - Replacement X-axis datasets that are descending or otherwise not monotonic are
   displayed in their original index order, with tick labels taken from the
   source axis values rather than sorted into ascending order.
+- Enable **Sort X ascending** to sort replacement X-axis values into monotonic
+  increasing order and reorder the corresponding line samples or heatmap columns
+  to match.
 - For 2D datasets, **Flip X/Y** transposes the display so rows are shown on X
   and columns on Y. The **Y axis** selector can also replace row coordinates
   with a compatible 1D dataset. Scalar HDF5 array datatypes, such as a
