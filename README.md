@@ -97,6 +97,24 @@ release workflow.
   and columns on Y. The **Y axis** selector can also replace row coordinates
   with a compatible 1D dataset. Scalar HDF5 array datatypes, such as a
   fixed-length `Wavelengths` array, are treated as 1D numeric axis datasets.
+- Enable **Slice plots** on a 2D dataset to open dockable row and column slice
+  plots. Click the heatmap or type row/column indices to choose the slice.
+- Open **Filters > Savitzky-Golay** to enable or configure a non-destructive
+  display filter for the active plot. Window size, polynomial order, and
+  derivative order update live. A 2D filter can run along displayed X or Y;
+  1D filtering always follows X. Derivatives use sample-index units.
+- Open **Filters > Windowed Average** for a centered moving average along X or
+  Y. Its odd window size updates live, edge windows use the available samples,
+  and non-finite values are ignored.
+- Open **Filters > FFT** for a centered full-spectrum transform. FFT can run
+  along displayed X or Y for 2D data and offers magnitude, power, phase, real,
+  or imaginary output; Rectangular, Hann, Hamming, and Blackman windows; mean
+  removal; optional decibel scaling; and automatic or manual sample spacing.
+  Uniform selected axis values produce physical frequency coordinates,
+  otherwise the axis is shown in cycles per sample.
+- The filter settings window shows the pipeline from top to bottom. Use the
+  arrow buttons beside a stage to move it earlier or later; enabled stages are
+  recomputed immediately in the displayed order.
 - The **Scaling** panel exposes auto/manual X and Y ranges for every plot. For
   2D datasets, color minimum and color maximum each have their own auto/manual
   checkbox.
@@ -105,6 +123,9 @@ release workflow.
   edited range fields stay linked to the current plot view. Auto/manual scaling
   choices are preserved across axis-definition changes and SWMR refreshes.
 - Unix timestamp-like X axes can be formatted as local date/time or UTC.
+- 2D previews preserve HDF5 row/column order. Descending or non-monotonic axis
+  datasets are shown as labels over source-index coordinates, so applying an
+  axis never silently reverses the underlying image.
 - Line plots use a fixed high-contrast palette against the dark UI.
 - Dear ImGui is built with FreeType when `freetype2` is available. The app
   loads a platform TrueType font and bakes the font atlas at the window's
@@ -123,7 +144,9 @@ release workflow.
   views do not push millions of vertices through ImPlot each frame.
 - The render loop is event-driven while idle: static plots wait for input or a
   short idle tick instead of repainting continuously. Mouse interaction,
-  loading, and SWMR polling still use about 60 FPS pacing.
+  loading, and SWMR polling still use about 60 FPS pacing while focused.
+  Hidden or minimized windows skip OpenGL rendering, and unfocused windows are
+  limited to the idle cadence. Background loading and SWMR checks continue.
 - 2D datasets are sampled to a GPU texture capped by the current OpenGL maximum
   texture size and a conservative cell budget. Turbo color mapping is computed
   in parallel on CPU, then uploaded once as an RGBA texture and drawn with
@@ -131,6 +154,12 @@ release workflow.
 - CPU-side min/max and color conversion are capped to four worker threads by
   default. Set `HDF5_PLOTTER_MAX_THREADS=1` for lowest CPU impact, or a larger
   value for faster initial loading on workstation machines.
+- Filter stages run on background workers and keep the previous filtered result
+  visible until a reconfigured result is ready. Plot rendering, autoscaling,
+  heatmap colors, and 2D slice windows all consume the same cached pipeline
+  output; loaded HDF5 values are never modified.
+- FFT calculations use the BSD-licensed KISS FFT library as a statically linked
+  Meson fallback, so FFT adds no runtime package dependency.
 - ImPlot itself is immediate-mode and CPU-driven for plot geometry. The main
   GPU acceleration here is texture-backed rendering for 2D datasets.
 

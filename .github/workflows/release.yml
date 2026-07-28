@@ -60,6 +60,7 @@ jobs:
         run: |
           meson setup build-release --buildtype=release -Dstrip=true --prefix=/usr
           meson compile -C build-release
+          meson test -C build-release --print-errorlogs
 
       - name: Package .deb
         shell: bash
@@ -70,6 +71,7 @@ jobs:
           mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/$package"
           install -m 0755 build-release/hdf5_plotter "$root/usr/bin/hdf5_plotter"
           install -m 0644 README.md "$root/usr/share/doc/$package/README.md"
+          install -m 0644 THIRD_PARTY_NOTICES.md "$root/usr/share/doc/$package/THIRD_PARTY_NOTICES.md"
           cat > "$root/usr/share/doc/$package/RUNTIME-DEPS.txt" <<DEPS
           Runtime dependencies for Debian ${{ matrix.version }} (${{ matrix.codename }}):
             libc6
@@ -142,6 +144,7 @@ jobs:
         run: |
           meson setup build-release --buildtype=release -Dstrip=true
           meson compile -C build-release
+          meson test -C build-release --print-errorlogs
 
       - name: Package .app
         shell: bash
@@ -203,6 +206,7 @@ jobs:
         run: |
           meson setup build-release --buildtype=release -Dstrip=true
           meson compile -C build-release
+          meson test -C build-release --print-errorlogs
 
       - name: Package Windows zip
         run: |

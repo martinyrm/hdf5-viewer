@@ -3,6 +3,10 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_sdl2.h"
 #include "implot.h"
+#include "fft_transform.h"
+#include "plot_axis_mapping.h"
+#include "savitzky_golay.h"
+#include "windowed_average.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -171,6 +175,10 @@ struct LoadedDataset {
 
     std::vector<uint8_t> rgba;
     std::vector<float> heat_values;
+    std::vector<double> heat_x_values;
+    std::vector<double> heat_y_values;
+    std::vector<double> y_axis_label_values;
+    bool y_axis_labels_from_values = false;
     int texture_width = 0;
     int texture_height = 0;
     hsize_t source_rows = 0;
@@ -189,6 +197,7 @@ struct LoadedDataset {
     float value_max = 1.0f;
     float applied_color_min = std::numeric_limits<float>::quiet_NaN();
     float applied_color_max = std::numeric_limits<float>::quiet_NaN();
+    int applied_color_generation = -1;
 };
 
 struct LoadConfig {
@@ -276,6 +285,82 @@ struct PlotControls {
     ColorRangeControl color;
 };
 
+struct SliceState {
+    bool enabled = false;
+    bool row_window_open = true;
+    bool column_window_open = true;
+    int row_index = 0;
+    int column_index = 0;
+    bool heatmap_view_valid = false;
+    double view_x_min = 0.0;
+    double view_x_max = 1.0;
+    double view_y_min = 0.0;
+    double view_y_max = 1.0;
+};
+
+enum class PlotFilterKind { SavitzkyGolay, WindowedAverage, Fft };
+
+struct PlotFilterStage {
+    explicit PlotFilterStage(PlotFilterKind stage_kind = PlotFilterKind::SavitzkyGolay) : kind(stage_kind) {}
+
+    PlotFilterKind kind = PlotFilterKind::SavitzkyGolay;
+    bool enabled = false;
+    hdf5_plotter::SavitzkyGolayParameters savitzky_golay;
+    hdf5_plotter::WindowedAverageParameters windowed_average;
+    hdf5_plotter::FftParameters fft;
+};
+
+struct FilterPipelineResult {
+    int token = 0;
+    bool ok = false;
+    std::string error;
+    std::shared_ptr<LoadedDataset> source;
+    std::vector<float> values;
+    float value_min = 0.0f;
+    float value_max = 1.0f;
+    bool x_axis_override = false;
+    bool y_axis_override = false;
+    std::vector<double> x_axis_values;
+    std::vector<double> y_axis_values;
+    double x_min = 0.0;
+    double x_max = 1.0;
+    double y_min = 0.0;
+    double y_max = 1.0;
+    std::string x_label;
+    std::string y_label;
+    std::string value_label;
+};
+
+struct FilterPipelineState {
+    std::vector<PlotFilterStage> stages = {PlotFilterStage{PlotFilterKind::SavitzkyGolay},
+                                           PlotFilterStage{PlotFilterKind::WindowedAverage},
+                                           PlotFilterStage{PlotFilterKind::Fft}};
+    bool settings_open = false;
+    bool processing = false;
+    bool recompute_pending = false;
+    int requested_token = 0;
+    int output_token = 0;
+    std::future<FilterPipelineResult> future;
+    std::shared_ptr<std::atomic<bool>> cancel_requested;
+    std::shared_ptr<LoadedDataset> output_source;
+    std::vector<float> output_values;
+    float output_min = 0.0f;
+    float output_max = 1.0f;
+    bool x_axis_override = false;
+    bool y_axis_override = false;
+    std::vector<double> x_axis_values;
+    std::vector<double> y_axis_values;
+    double x_min = 0.0;
+    double x_max = 1.0;
+    double y_min = 0.0;
+    double y_max = 1.0;
+    std::string x_label;
+    std::string y_label;
+    std::string value_label;
+    bool preserve_axis_controls_on_next_result = false;
+    std::string error;
+};
+
 struct FileTab {
     int id = 0;
     std::array<char, 4096> file_path{};
@@ -304,6 +389,8 @@ struct FileTab {
     LineCache line_cache;
     PlotControls controls;
     PlotControls preserved_controls;
+    SliceState slices;
+    FilterPipelineState filters;
 
     bool swmr_available = false;
     bool live_swmr_enabled = false;
@@ -356,7 +443,11 @@ struct AppState {
     bool last_fast_frame = false;
     bool last_background_work = false;
     bool last_ui_active = false;
+    bool last_window_drawable = true;
+    bool last_window_focused = true;
 };
+
+void clamp_slice_state(FileTab &tab, const LoadedDataset &data);
 
 std::string trim(std::string s) {
     const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
@@ -676,33 +767,21 @@ int unix_time_formatter(double value, char *buffer, int size, void *user_data) {
 }
 
 struct AxisValueFormatterData {
-    const LoadedDataset *data = nullptr;
+    const std::vector<double> *values = nullptr;
+    double axis_min = 0.0;
+    double axis_max = 1.0;
     bool datetime = false;
     bool utc = false;
 };
 
-double index_ordered_axis_value(const LoadedDataset &data, double coordinate) {
-    const std::vector<double> &values = data.x_axis_label_values;
-    if (values.empty()) {
-        return coordinate;
-    }
-    if (values.size() == 1 || data.x_max == data.x_min) {
-        return values.front();
-    }
-
-    const double t = (coordinate - data.x_min) / (data.x_max - data.x_min);
-    const double clamped = std::clamp(std::isfinite(t) ? t : 0.0, 0.0, 1.0);
-    const size_t index = static_cast<size_t>(std::llround(clamped * static_cast<double>(values.size() - 1)));
-    return values[std::min(index, values.size() - 1)];
-}
-
 int index_ordered_axis_formatter(double value, char *buffer, int size, void *user_data) {
     const auto *formatter = static_cast<const AxisValueFormatterData *>(user_data);
-    if (formatter == nullptr || formatter->data == nullptr) {
+    if (formatter == nullptr || formatter->values == nullptr) {
         return std::snprintf(buffer, static_cast<size_t>(size), "%.6g", value);
     }
 
-    const double label_value = index_ordered_axis_value(*formatter->data, value);
+    const double label_value = hdf5_plotter::axis_label_value_at_coordinate(
+        *formatter->values, value, formatter->axis_min, formatter->axis_max);
     if (formatter->datetime) {
         bool utc = formatter->utc;
         return unix_time_formatter(label_value, buffer, size, &utc);
@@ -713,7 +792,9 @@ int index_ordered_axis_formatter(double value, char *buffer, int size, void *use
 void setup_x_axis_format(FileTab &tab, const LoadedDataset &data, AxisValueFormatterData &formatter) {
     const bool datetime = tab.x_datetime && looks_like_unix_time_axis(data);
     if (data.x_axis_labels_from_values && !data.x_axis_label_values.empty()) {
-        formatter.data = &data;
+        formatter.values = &data.x_axis_label_values;
+        formatter.axis_min = data.x_min;
+        formatter.axis_max = data.x_max;
         formatter.datetime = datetime;
         formatter.utc = tab.x_datetime_utc;
         ImPlot::SetupAxisFormat(ImAxis_X1, index_ordered_axis_formatter, &formatter);
@@ -722,9 +803,32 @@ void setup_x_axis_format(FileTab &tab, const LoadedDataset &data, AxisValueForma
     }
 }
 
+void setup_y_axis_format(const LoadedDataset &data, ImAxis axis, AxisValueFormatterData &formatter) {
+    if (!data.y_axis_labels_from_values || data.y_axis_label_values.empty()) {
+        return;
+    }
+    formatter.values = &data.y_axis_label_values;
+    formatter.axis_min = data.y_min;
+    formatter.axis_max = data.y_max;
+    ImPlot::SetupAxisFormat(axis, index_ordered_axis_formatter, &formatter);
+}
+
 bool preferred_name(const std::string &name, const std::vector<std::string> &preferred) {
     const std::string lowered = lower_ascii(name);
     return std::find(preferred.begin(), preferred.end(), lowered) != preferred.end();
+}
+
+bool plausible_axis_name(const std::string &name) {
+    const std::string lowered = lower_ascii(name);
+    if (lowered == "x" || lowered == "y" || lowered == "row" || lowered == "rows" ||
+        lowered == "column" || lowered == "columns") {
+        return true;
+    }
+    static const std::array<const char *, 8> axis_terms = {
+        "axis", "coord", "index", "time", "freq", "wave", "delay", "position"};
+    return std::any_of(axis_terms.begin(), axis_terms.end(), [&](const char *term) {
+        return lowered.find(term) != std::string::npos;
+    });
 }
 
 DatasetInfo inspect_dataset(hid_t file, const std::string &open_path, const std::string &display_path) {
@@ -1647,12 +1751,7 @@ AxisSpec find_axis(const std::vector<DatasetInfo> &datasets, const DatasetInfo &
     if (best != matches.end()) {
         return {(*best)->path, base_name((*best)->path)};
     }
-    if (matches.size() == 1) {
-        best = matches.begin();
-        return {(*best)->path, base_name((*best)->path)};
-    }
-
-    if (matches.empty() && !preferred_anywhere.empty()) {
+    if (!preferred_anywhere.empty()) {
         const auto common_prefix_len = [](const std::string &lhs, const std::string &rhs) {
             size_t count = 0;
             const size_t limit = std::min(lhs.size(), rhs.size());
@@ -1666,9 +1765,8 @@ AxisSpec find_axis(const std::vector<DatasetInfo> &datasets, const DatasetInfo &
         });
         return {(*preferred_best)->path, base_name((*preferred_best)->path)};
     }
-
-    if (matches.size() > 1) {
-        return {};
+    if (matches.size() == 1 && plausible_axis_name(base_name(matches.front()->path))) {
+        return {matches.front()->path, base_name(matches.front()->path)};
     }
     return {};
 }
@@ -1762,7 +1860,8 @@ void apply_axis_range(const std::string &file_path, const AxisSpec &axis, double
 }
 
 LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo info, AxisSpec x_axis, AxisSpec y_axis,
-                               DatasetInfo x_axis_info, bool has_x_axis_info, LoadConfig config) {
+                               DatasetInfo x_axis_info, bool has_x_axis_info, DatasetInfo y_axis_info,
+                               bool has_y_axis_info, LoadConfig config) {
     LoadResult result;
     result.token = token;
     result.data = std::make_shared<LoadedDataset>();
@@ -1856,9 +1955,10 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
                 texture_rows = cols;
                 texture_cols = rows;
             }
+            const hsize_t x_axis_stride = config.transpose_2d ? plan.row_stride : plan.col_stride;
+            const hsize_t y_axis_stride = config.transpose_2d ? plan.col_stride : plan.row_stride;
             bool applied_x_axis_values = false;
             if (has_x_axis_info && !x_axis.path.empty()) {
-                const hsize_t x_axis_stride = config.transpose_2d ? plan.row_stride : plan.col_stride;
                 std::vector<double> x_values = read_1d_dataset_double(file_path, x_axis_info, x_axis_stride);
                 if (x_values.size() == static_cast<size_t>(texture_cols)) {
                     result.data->x_label = x_axis.label;
@@ -1867,20 +1967,65 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
                         const std::vector<size_t> order = ascending_axis_permutation(x_values);
                         values = reorder_2d_columns(values, texture_rows, texture_cols, order);
                         x_values = reordered_by_permutation(x_values, order);
-                        auto [x_min, x_max] = finite_minmax(x_values);
-                        result.data->x_min = x_min;
-                        result.data->x_max = x_max;
-                        applied_x_axis_values = true;
-                    } else if (!is_monotonic_increasing(x_values)) {
-                        result.data->x_min = 0.0;
-                        result.data->x_max =
-                            config.x_fallback_count > 1 ? static_cast<double>(config.x_fallback_count - 1) : 0.0;
-                        result.data->x_axis_labels_from_values = true;
-                        result.data->x_axis_label_values = std::move(x_values);
-                        applied_x_axis_values = true;
                     }
+                    const hdf5_plotter::PreviewAxisMapping mapping =
+                        hdf5_plotter::make_preview_axis_mapping(
+                            x_values, static_cast<size_t>(texture_cols),
+                            static_cast<size_t>(x_axis_stride),
+                            static_cast<size_t>(config.x_fallback_count));
+                    result.data->x_min = mapping.min;
+                    result.data->x_max = mapping.max;
+                    result.data->x_axis_labels_from_values = mapping.labels_from_values;
+                    if (mapping.labels_from_values) {
+                        result.data->x_axis_label_values = x_values;
+                    }
+                    result.data->heat_x_values = std::move(x_values);
+                    applied_x_axis_values = true;
                 }
             }
+            bool applied_y_axis_values = false;
+            if (has_y_axis_info && !y_axis.path.empty()) {
+                std::vector<double> y_values = read_1d_dataset_double(file_path, y_axis_info, y_axis_stride);
+                if (y_values.size() == static_cast<size_t>(texture_rows)) {
+                    result.data->y_label = y_axis.label;
+                    const hdf5_plotter::PreviewAxisMapping mapping =
+                        hdf5_plotter::make_preview_axis_mapping(
+                            y_values, static_cast<size_t>(texture_rows),
+                            static_cast<size_t>(y_axis_stride),
+                            static_cast<size_t>(config.y_fallback_count));
+                    result.data->y_min = mapping.min;
+                    result.data->y_max = mapping.max;
+                    result.data->y_axis_labels_from_values = mapping.labels_from_values;
+                    if (mapping.labels_from_values) {
+                        result.data->y_axis_label_values = y_values;
+                    }
+                    result.data->heat_y_values = std::move(y_values);
+                    applied_y_axis_values = true;
+                }
+            }
+            if (!applied_x_axis_values) {
+                const hdf5_plotter::PreviewAxisMapping mapping =
+                    hdf5_plotter::make_preview_axis_mapping(
+                        {}, static_cast<size_t>(texture_cols),
+                        static_cast<size_t>(x_axis_stride),
+                        static_cast<size_t>(config.x_fallback_count));
+                result.data->x_min = mapping.min;
+                result.data->x_max = mapping.max;
+                result.data->x_label = x_axis.label.empty() ? config.x_fallback_label : x_axis.label;
+                result.data->x_source_path = x_axis.path;
+            }
+            if (!applied_y_axis_values) {
+                const hdf5_plotter::PreviewAxisMapping mapping =
+                    hdf5_plotter::make_preview_axis_mapping(
+                        {}, static_cast<size_t>(texture_rows),
+                        static_cast<size_t>(y_axis_stride),
+                        static_cast<size_t>(config.y_fallback_count));
+                result.data->y_min = mapping.min;
+                result.data->y_max = mapping.max;
+                result.data->y_label = y_axis.label.empty() ? config.y_fallback_label : y_axis.label;
+            }
+            normalize_range(result.data->x_min, result.data->x_max);
+            normalize_range(result.data->y_min, result.data->y_max);
             const auto minmax = finite_minmax(values);
             const float min_value = minmax.first;
             const float max_value = minmax.second;
@@ -1899,12 +2044,7 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
             result.data->value_max = max_value;
             result.data->applied_color_min = min_value;
             result.data->applied_color_max = max_value;
-            if (!applied_x_axis_values) {
-                apply_axis_range(file_path, x_axis, 0.0, static_cast<double>(config.x_fallback_count - 1),
-                                 config.x_fallback_label, result.data->x_min, result.data->x_max, result.data->x_label);
-            }
-            apply_axis_range(file_path, y_axis, 0.0, static_cast<double>(config.y_fallback_count - 1),
-                             config.y_fallback_label, result.data->y_min, result.data->y_max, result.data->y_label);
+            result.data->applied_color_generation = 0;
             if (plan.row_stride > 1 || plan.col_stride > 1) {
                 result.data->note = "Texture preview sampled every " + std::to_string(plan.row_stride) + " row(s) and " +
                                     std::to_string(plan.col_stride) + " column(s).";
@@ -1919,6 +2059,574 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
         result.error = ex.what();
         return result;
     }
+}
+
+PlotFilterStage &savitzky_golay_stage(FilterPipelineState &filters) {
+    auto found = std::find_if(filters.stages.begin(), filters.stages.end(), [](const PlotFilterStage &stage) {
+        return stage.kind == PlotFilterKind::SavitzkyGolay;
+    });
+    if (found == filters.stages.end()) {
+        filters.stages.push_back(PlotFilterStage{});
+        return filters.stages.back();
+    }
+    return *found;
+}
+
+PlotFilterStage &windowed_average_stage(FilterPipelineState &filters) {
+    auto found = std::find_if(filters.stages.begin(), filters.stages.end(), [](const PlotFilterStage &stage) {
+        return stage.kind == PlotFilterKind::WindowedAverage;
+    });
+    if (found == filters.stages.end()) {
+        filters.stages.push_back(PlotFilterStage{PlotFilterKind::WindowedAverage});
+        return filters.stages.back();
+    }
+    return *found;
+}
+
+PlotFilterStage &fft_stage(FilterPipelineState &filters) {
+    auto found = std::find_if(filters.stages.begin(), filters.stages.end(), [](const PlotFilterStage &stage) {
+        return stage.kind == PlotFilterKind::Fft;
+    });
+    if (found == filters.stages.end()) {
+        filters.stages.push_back(PlotFilterStage{PlotFilterKind::Fft});
+        return filters.stages.back();
+    }
+    return *found;
+}
+
+bool filter_pipeline_enabled(const FilterPipelineState &filters) {
+    return std::any_of(filters.stages.begin(), filters.stages.end(),
+                       [](const PlotFilterStage &stage) { return stage.enabled; });
+}
+
+const std::vector<float> &source_plot_values(const LoadedDataset &data) {
+    return data.kind == LoadedKind::Heatmap2D ? data.heat_values : data.line_values;
+}
+
+std::pair<size_t, size_t> plot_value_dimensions(const LoadedDataset &data) {
+    if (data.kind == LoadedKind::Heatmap2D) {
+        return {static_cast<size_t>(std::max(0, data.texture_width)),
+                static_cast<size_t>(std::max(0, data.texture_height))};
+    }
+    return {data.line_values.size(), 1};
+}
+
+struct AxisSampling {
+    double spacing = 1.0;
+    bool physical_units = false;
+    std::string frequency_label = "frequency (cycles/sample)";
+};
+
+bool generic_index_axis_label(const std::string &label) {
+    const std::string lowered = lower_ascii(label);
+    return lowered.empty() || lowered == "index" || lowered == "indices" || lowered == "row" ||
+           lowered == "rows" || lowered == "column" || lowered == "columns";
+}
+
+AxisSampling fft_axis_sampling(const LoadedDataset &data, hdf5_plotter::FilterAxis axis) {
+    const auto [width, height] = plot_value_dimensions(data);
+    const size_t count = axis == hdf5_plotter::FilterAxis::X ? width : height;
+    const std::vector<double> *axis_values = nullptr;
+    const std::string &axis_label = axis == hdf5_plotter::FilterAxis::X ? data.x_label : data.y_label;
+    double axis_min = axis == hdf5_plotter::FilterAxis::X ? data.x_min : data.y_min;
+    double axis_max = axis == hdf5_plotter::FilterAxis::X ? data.x_max : data.y_max;
+    if (data.kind == LoadedKind::Line1D) {
+        axis_values = &data.line_x_values;
+    } else if (axis == hdf5_plotter::FilterAxis::X) {
+        axis_values = &data.heat_x_values;
+    } else {
+        axis_values = &data.heat_y_values;
+    }
+
+    AxisSampling sampling;
+    bool uniform_values = false;
+    if (axis_values != nullptr && axis_values->size() == count && count >= 2) {
+        const double mean_step = (axis_values->back() - axis_values->front()) / static_cast<double>(count - 1);
+        if (std::isfinite(mean_step) && mean_step != 0.0) {
+            const double tolerance = std::max(1e-12, std::abs(mean_step) * 1e-4);
+            uniform_values = true;
+            for (size_t i = 1; i < count; ++i) {
+                const double step = (*axis_values)[i] - (*axis_values)[i - 1];
+                if (!std::isfinite(step) || std::abs(step - mean_step) > tolerance) {
+                    uniform_values = false;
+                    break;
+                }
+            }
+            if (uniform_values) {
+                sampling.spacing = std::abs(mean_step);
+            }
+        }
+    } else if (count >= 2 && std::isfinite(axis_min) && std::isfinite(axis_max) && axis_min != axis_max) {
+        sampling.spacing = std::abs(axis_max - axis_min) / static_cast<double>(count - 1);
+        uniform_values = std::isfinite(sampling.spacing) && sampling.spacing > 0.0;
+    }
+
+    if (!uniform_values) {
+        sampling.spacing = 1.0;
+    }
+    sampling.physical_units = uniform_values && !generic_index_axis_label(axis_label);
+    if (sampling.physical_units) {
+        sampling.frequency_label = "frequency (1/" + axis_label + ")";
+    }
+    return sampling;
+}
+
+std::string fft_value_label(const hdf5_plotter::FftParameters &parameters) {
+    switch (parameters.value_mode) {
+    case hdf5_plotter::FftValueMode::Magnitude:
+        return parameters.decibels ? "FFT magnitude (dB)" : "FFT magnitude";
+    case hdf5_plotter::FftValueMode::Power:
+        return parameters.decibels ? "FFT power (dB)" : "FFT power";
+    case hdf5_plotter::FftValueMode::Phase:
+        return "FFT phase (rad)";
+    case hdf5_plotter::FftValueMode::Real:
+        return "FFT real";
+    case hdf5_plotter::FftValueMode::Imaginary:
+        return "FFT imaginary";
+    }
+    return "FFT";
+}
+
+size_t savitzky_golay_axis_length(const LoadedDataset &data,
+                                  hdf5_plotter::FilterAxis axis) {
+    if (data.kind == LoadedKind::Line1D) {
+        return data.line_values.size();
+    }
+    const auto [width, height] = plot_value_dimensions(data);
+    return hdf5_plotter::savitzky_golay_axis_length(width, height, axis);
+}
+
+size_t windowed_average_axis_length(const LoadedDataset &data, hdf5_plotter::FilterAxis axis) {
+    if (data.kind == LoadedKind::Line1D) {
+        return data.line_values.size();
+    }
+    const auto [width, height] = plot_value_dimensions(data);
+    return hdf5_plotter::windowed_average_axis_length(width, height, axis);
+}
+
+bool sanitize_savitzky_golay_parameters(const LoadedDataset &data,
+                                        hdf5_plotter::SavitzkyGolayParameters &parameters) {
+    const hdf5_plotter::SavitzkyGolayParameters original = parameters;
+    if (data.kind == LoadedKind::Line1D) {
+        parameters.axis = hdf5_plotter::FilterAxis::X;
+    } else if (savitzky_golay_axis_length(data, parameters.axis) < 3) {
+        const hdf5_plotter::FilterAxis other_axis =
+            parameters.axis == hdf5_plotter::FilterAxis::X ? hdf5_plotter::FilterAxis::Y
+                                                            : hdf5_plotter::FilterAxis::X;
+        if (savitzky_golay_axis_length(data, other_axis) >= 3) {
+            parameters.axis = other_axis;
+        }
+    }
+
+    const size_t axis_length = savitzky_golay_axis_length(data, parameters.axis);
+    int max_window = static_cast<int>(std::min<size_t>(axis_length, 501));
+    if (max_window % 2 == 0) {
+        --max_window;
+    }
+    max_window = std::max(3, max_window);
+    parameters.window_size = std::clamp(parameters.window_size, 3, max_window);
+    if (parameters.window_size % 2 == 0) {
+        parameters.window_size =
+            parameters.window_size < max_window ? parameters.window_size + 1 : parameters.window_size - 1;
+    }
+    parameters.polynomial_order =
+        std::clamp(parameters.polynomial_order, 0, std::min(10, parameters.window_size - 1));
+    parameters.derivative_order =
+        std::clamp(parameters.derivative_order, 0, parameters.polynomial_order);
+    return parameters.window_size != original.window_size ||
+           parameters.polynomial_order != original.polynomial_order ||
+           parameters.derivative_order != original.derivative_order || parameters.axis != original.axis;
+}
+
+bool sanitize_windowed_average_parameters(const LoadedDataset &data,
+                                          hdf5_plotter::WindowedAverageParameters &parameters) {
+    const hdf5_plotter::WindowedAverageParameters original = parameters;
+    if (data.kind == LoadedKind::Line1D) {
+        parameters.axis = hdf5_plotter::FilterAxis::X;
+    } else if (windowed_average_axis_length(data, parameters.axis) < 3) {
+        const hdf5_plotter::FilterAxis other_axis =
+            parameters.axis == hdf5_plotter::FilterAxis::X ? hdf5_plotter::FilterAxis::Y
+                                                            : hdf5_plotter::FilterAxis::X;
+        if (windowed_average_axis_length(data, other_axis) >= 3) {
+            parameters.axis = other_axis;
+        }
+    }
+
+    const size_t axis_length = windowed_average_axis_length(data, parameters.axis);
+    if (axis_length < 3) {
+        parameters.window_size = 3;
+    } else {
+        int max_window =
+            static_cast<int>(std::min<size_t>(axis_length, static_cast<size_t>(std::numeric_limits<int>::max())));
+        if (max_window % 2 == 0) {
+            --max_window;
+        }
+        parameters.window_size = std::clamp(parameters.window_size, 3, max_window);
+        if (parameters.window_size % 2 == 0) {
+            parameters.window_size =
+                parameters.window_size < max_window ? parameters.window_size + 1 : parameters.window_size - 1;
+        }
+    }
+    return parameters.window_size != original.window_size || parameters.axis != original.axis;
+}
+
+void sanitize_fft_parameters(const LoadedDataset &data, hdf5_plotter::FftParameters &parameters) {
+    if (data.kind == LoadedKind::Line1D) {
+        parameters.axis = hdf5_plotter::FilterAxis::X;
+        return;
+    }
+    const auto [width, height] = plot_value_dimensions(data);
+    const size_t current_length = parameters.axis == hdf5_plotter::FilterAxis::X ? width : height;
+    if (current_length >= 2) {
+        return;
+    }
+    parameters.axis = width >= 2 ? hdf5_plotter::FilterAxis::X : hdf5_plotter::FilterAxis::Y;
+}
+
+FilterPipelineResult filter_pipeline_worker(int token, std::shared_ptr<LoadedDataset> source,
+                                            std::vector<PlotFilterStage> stages,
+                                            std::shared_ptr<std::atomic<bool>> cancel_requested) {
+    FilterPipelineResult result;
+    result.token = token;
+    result.source = std::move(source);
+    try {
+        if (!result.source) {
+            throw std::runtime_error("no dataset is loaded");
+        }
+        const auto [width, height] = plot_value_dimensions(*result.source);
+        const std::vector<float> *current = &source_plot_values(*result.source);
+        std::vector<float> filtered;
+        float value_min = result.source->value_min;
+        float value_max = result.source->value_max;
+        bool applied_stage = false;
+
+        for (const PlotFilterStage &stage : stages) {
+            if (!stage.enabled) {
+                continue;
+            }
+            if (cancel_requested->load(std::memory_order_relaxed)) {
+                throw std::runtime_error("filter update cancelled");
+            }
+            switch (stage.kind) {
+            case PlotFilterKind::SavitzkyGolay: {
+                hdf5_plotter::SavitzkyGolayParameters parameters = stage.savitzky_golay;
+                if (result.source->kind == LoadedKind::Line1D) {
+                    parameters.axis = hdf5_plotter::FilterAxis::X;
+                }
+                hdf5_plotter::SavitzkyGolayOutput output =
+                    hdf5_plotter::apply_savitzky_golay(*current, width, height, parameters, cpu_worker_limit(),
+                                                      cancel_requested.get());
+                filtered = std::move(output.values);
+                value_min = output.value_min;
+                value_max = output.value_max;
+                current = &filtered;
+                applied_stage = true;
+                break;
+            }
+            case PlotFilterKind::WindowedAverage: {
+                hdf5_plotter::WindowedAverageParameters parameters = stage.windowed_average;
+                if (result.source->kind == LoadedKind::Line1D) {
+                    parameters.axis = hdf5_plotter::FilterAxis::X;
+                }
+                hdf5_plotter::WindowedAverageOutput output =
+                    hdf5_plotter::apply_windowed_average(*current, width, height, parameters,
+                                                         cpu_worker_limit(), cancel_requested.get());
+                filtered = std::move(output.values);
+                value_min = output.value_min;
+                value_max = output.value_max;
+                current = &filtered;
+                applied_stage = true;
+                break;
+            }
+            case PlotFilterKind::Fft: {
+                hdf5_plotter::FftParameters parameters = stage.fft;
+                if (result.source->kind == LoadedKind::Line1D) {
+                    parameters.axis = hdf5_plotter::FilterAxis::X;
+                }
+                AxisSampling sampling = fft_axis_sampling(*result.source, parameters.axis);
+                if (!parameters.automatic_spacing && std::isfinite(parameters.sample_spacing) &&
+                    parameters.sample_spacing > 0.0) {
+                    sampling.spacing = parameters.sample_spacing;
+                    const std::string &axis_label = parameters.axis == hdf5_plotter::FilterAxis::X
+                                                        ? result.source->x_label
+                                                        : result.source->y_label;
+                    sampling.physical_units = !generic_index_axis_label(axis_label);
+                    sampling.frequency_label = sampling.physical_units
+                                                   ? "frequency (1/" + axis_label + ")"
+                                                   : "frequency (cycles/sample)";
+                }
+                hdf5_plotter::FftOutput output =
+                    hdf5_plotter::apply_fft_transform(*current, width, height, parameters, sampling.spacing,
+                                                      cpu_worker_limit(), cancel_requested.get());
+                filtered = std::move(output.values);
+                value_min = output.value_min;
+                value_max = output.value_max;
+                current = &filtered;
+                applied_stage = true;
+                if (parameters.axis == hdf5_plotter::FilterAxis::X) {
+                    result.x_axis_override = true;
+                    result.x_axis_values = std::move(output.frequency_values);
+                    result.x_min = result.x_axis_values.front();
+                    result.x_max = result.x_axis_values.back();
+                    result.x_label = sampling.frequency_label;
+                } else {
+                    result.y_axis_override = true;
+                    result.y_axis_values = std::move(output.frequency_values);
+                    result.y_min = result.y_axis_values.front();
+                    result.y_max = result.y_axis_values.back();
+                    result.y_label = sampling.frequency_label;
+                }
+                result.value_label = fft_value_label(parameters);
+                break;
+            }
+            }
+        }
+
+        if (!applied_stage) {
+            filtered = *current;
+        }
+        result.values = std::move(filtered);
+        result.value_min = value_min;
+        result.value_max = value_max;
+        result.ok = true;
+    } catch (const std::exception &ex) {
+        result.error = ex.what();
+    }
+    return result;
+}
+
+bool filter_output_ready(const FileTab &tab, const LoadedDataset &data) {
+    const FilterPipelineState &filters = tab.filters;
+    return filter_pipeline_enabled(filters) && filters.output_source.get() == &data &&
+           filters.output_values.size() == source_plot_values(data).size();
+}
+
+const std::vector<float> &displayed_plot_values(const FileTab &tab, const LoadedDataset &data) {
+    return filter_output_ready(tab, data) ? tab.filters.output_values : source_plot_values(data);
+}
+
+std::pair<float, float> displayed_value_range(const FileTab &tab, const LoadedDataset &data) {
+    return filter_output_ready(tab, data) ? std::pair<float, float>{tab.filters.output_min, tab.filters.output_max}
+                                          : std::pair<float, float>{data.value_min, data.value_max};
+}
+
+int displayed_value_generation(const FileTab &tab, const LoadedDataset &data) {
+    return filter_output_ready(tab, data) ? tab.filters.output_token : 0;
+}
+
+bool displayed_x_axis_overridden(const FileTab &tab, const LoadedDataset &data) {
+    return filter_output_ready(tab, data) && tab.filters.x_axis_override;
+}
+
+bool displayed_y_axis_overridden(const FileTab &tab, const LoadedDataset &data) {
+    return filter_output_ready(tab, data) && tab.filters.y_axis_override;
+}
+
+double displayed_x_min(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_x_axis_overridden(tab, data) ? tab.filters.x_min : data.x_min;
+}
+
+double displayed_x_max(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_x_axis_overridden(tab, data) ? tab.filters.x_max : data.x_max;
+}
+
+double displayed_y_min(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_y_axis_overridden(tab, data) ? tab.filters.y_min : data.y_min;
+}
+
+double displayed_y_max(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_y_axis_overridden(tab, data) ? tab.filters.y_max : data.y_max;
+}
+
+const std::string &displayed_x_label(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_x_axis_overridden(tab, data) ? tab.filters.x_label : data.x_label;
+}
+
+const std::string &displayed_y_label(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_y_axis_overridden(tab, data) ? tab.filters.y_label : data.y_label;
+}
+
+std::string displayed_value_label(const FileTab &tab, const LoadedDataset &data) {
+    if (filter_output_ready(tab, data) && !tab.filters.value_label.empty()) {
+        return tab.filters.value_label;
+    }
+    return data.kind == LoadedKind::Line1D ? data.y_label : base_name(data.info.path);
+}
+
+const std::vector<double> &displayed_line_x_values(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_x_axis_overridden(tab, data) ? tab.filters.x_axis_values : data.line_x_values;
+}
+
+const std::vector<double> &displayed_heat_x_values(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_x_axis_overridden(tab, data) ? tab.filters.x_axis_values : data.heat_x_values;
+}
+
+const std::vector<double> &displayed_heat_y_values(const FileTab &tab, const LoadedDataset &data) {
+    return displayed_y_axis_overridden(tab, data) ? tab.filters.y_axis_values : data.heat_y_values;
+}
+
+void start_filter_pipeline(FileTab &tab) {
+    FilterPipelineState &filters = tab.filters;
+    if (filters.processing || !filters.recompute_pending || !filter_pipeline_enabled(filters) || !tab.loaded) {
+        return;
+    }
+    if (tab.loaded->kind != LoadedKind::Line1D && tab.loaded->kind != LoadedKind::Heatmap2D) {
+        filters.recompute_pending = false;
+        filters.error = "filters can only be applied to 1D or 2D numeric datasets";
+        return;
+    }
+
+    filters.processing = true;
+    filters.recompute_pending = false;
+    filters.error.clear();
+    const int token = filters.requested_token;
+    filters.cancel_requested = std::make_shared<std::atomic<bool>>(false);
+    filters.future = std::async(std::launch::async, filter_pipeline_worker, token, tab.loaded, filters.stages,
+                                filters.cancel_requested);
+}
+
+void request_filter_recompute(FileTab &tab) {
+    FilterPipelineState &filters = tab.filters;
+    if (filters.cancel_requested) {
+        filters.cancel_requested->store(true, std::memory_order_relaxed);
+    }
+    ++filters.requested_token;
+    filters.recompute_pending = filter_pipeline_enabled(filters) && tab.loaded != nullptr;
+    filters.error.clear();
+    start_filter_pipeline(tab);
+}
+
+void clear_filter_output_for_new_data(FileTab &tab, bool preserve_axis_controls = false) {
+    FilterPipelineState &filters = tab.filters;
+    const bool restore_x_axis = filters.x_axis_override;
+    const bool restore_y_axis = filters.y_axis_override;
+    bool keep_previous_output =
+        preserve_axis_controls && tab.loaded && filter_pipeline_enabled(filters) &&
+        filters.output_source && filters.output_values.size() == source_plot_values(*tab.loaded).size();
+    if (keep_previous_output) {
+        const auto old_dimensions = plot_value_dimensions(*filters.output_source);
+        const auto new_dimensions = plot_value_dimensions(*tab.loaded);
+        keep_previous_output =
+            filters.output_source->kind == tab.loaded->kind && old_dimensions == new_dimensions;
+    }
+    if (filters.cancel_requested) {
+        filters.cancel_requested->store(true, std::memory_order_relaxed);
+    }
+    ++filters.requested_token;
+    filters.preserve_axis_controls_on_next_result =
+        preserve_axis_controls && (restore_x_axis || restore_y_axis);
+    if (keep_previous_output) {
+        filters.output_source = tab.loaded;
+    } else {
+        filters.output_source.reset();
+        filters.output_values.clear();
+        filters.output_token = 0;
+        filters.x_axis_override = false;
+        filters.y_axis_override = false;
+        filters.x_axis_values.clear();
+        filters.y_axis_values.clear();
+        filters.x_label.clear();
+        filters.y_label.clear();
+        filters.value_label.clear();
+    }
+    if (!preserve_axis_controls && tab.loaded && restore_x_axis) {
+        tab.controls.x.min = tab.loaded->x_min;
+        tab.controls.x.max = tab.loaded->x_max;
+        tab.controls.x.automatic = false;
+    }
+    if (!preserve_axis_controls && tab.loaded && restore_y_axis &&
+        tab.loaded->kind == LoadedKind::Heatmap2D) {
+        tab.controls.y.min = tab.loaded->y_min;
+        tab.controls.y.max = tab.loaded->y_max;
+        tab.controls.y.automatic = false;
+    }
+    filters.error.clear();
+    if (tab.loaded) {
+        for (PlotFilterStage &stage : filters.stages) {
+            switch (stage.kind) {
+            case PlotFilterKind::SavitzkyGolay:
+                sanitize_savitzky_golay_parameters(*tab.loaded, stage.savitzky_golay);
+                break;
+            case PlotFilterKind::WindowedAverage:
+                sanitize_windowed_average_parameters(*tab.loaded, stage.windowed_average);
+                break;
+            case PlotFilterKind::Fft:
+                sanitize_fft_parameters(*tab.loaded, stage.fft);
+                break;
+            }
+        }
+    }
+    filters.recompute_pending = filter_pipeline_enabled(filters) && tab.loaded != nullptr;
+    tab.line_cache = {};
+    start_filter_pipeline(tab);
+}
+
+bool poll_filter_pipeline(FileTab &tab) {
+    FilterPipelineState &filters = tab.filters;
+    bool changed = false;
+    if (filters.processing && filters.future.valid()) {
+        using namespace std::chrono_literals;
+        if (filters.future.wait_for(0ms) == std::future_status::ready) {
+            FilterPipelineResult result = filters.future.get();
+            filters.processing = false;
+            changed = true;
+            if (result.token == filters.requested_token && result.source == tab.loaded &&
+                filter_pipeline_enabled(filters)) {
+                const bool preserve_axis_controls = filters.preserve_axis_controls_on_next_result;
+                filters.preserve_axis_controls_on_next_result = false;
+                if (result.ok) {
+                    const bool x_axis_changed =
+                        filters.x_axis_override != result.x_axis_override ||
+                        (result.x_axis_override &&
+                         (filters.x_min != result.x_min || filters.x_max != result.x_max ||
+                          filters.x_label != result.x_label));
+                    const bool y_axis_changed =
+                        filters.y_axis_override != result.y_axis_override ||
+                        (result.y_axis_override &&
+                         (filters.y_min != result.y_min || filters.y_max != result.y_max ||
+                          filters.y_label != result.y_label));
+                    filters.output_source = std::move(result.source);
+                    filters.output_values = std::move(result.values);
+                    filters.output_min = result.value_min;
+                    filters.output_max = result.value_max;
+                    filters.output_token = result.token;
+                    filters.x_axis_override = result.x_axis_override;
+                    filters.y_axis_override = result.y_axis_override;
+                    filters.x_axis_values = std::move(result.x_axis_values);
+                    filters.y_axis_values = std::move(result.y_axis_values);
+                    filters.x_min = result.x_min;
+                    filters.x_max = result.x_max;
+                    filters.y_min = result.y_min;
+                    filters.y_max = result.y_max;
+                    filters.x_label = std::move(result.x_label);
+                    filters.y_label = std::move(result.y_label);
+                    filters.value_label = std::move(result.value_label);
+                    filters.error.clear();
+                    tab.line_cache = {};
+                    if (x_axis_changed && tab.loaded && !preserve_axis_controls) {
+                        tab.controls.x.min = filters.x_axis_override ? filters.x_min : tab.loaded->x_min;
+                        tab.controls.x.max = filters.x_axis_override ? filters.x_max : tab.loaded->x_max;
+                        tab.controls.x.automatic = false;
+                        tab.slices.heatmap_view_valid = false;
+                    }
+                    if (y_axis_changed && tab.loaded && tab.loaded->kind == LoadedKind::Heatmap2D &&
+                        !preserve_axis_controls) {
+                        tab.controls.y.min = filters.y_axis_override ? filters.y_min : tab.loaded->y_min;
+                        tab.controls.y.max = filters.y_axis_override ? filters.y_max : tab.loaded->y_max;
+                        tab.controls.y.automatic = false;
+                        tab.slices.heatmap_view_valid = false;
+                    }
+                } else {
+                    filters.error = std::move(result.error);
+                }
+            }
+        }
+    }
+    if (!filters.processing && filters.recompute_pending) {
+        start_filter_pipeline(tab);
+        changed = true;
+    }
+    return changed;
 }
 
 void delete_heat_texture(FileTab &tab) {
@@ -1948,31 +2656,34 @@ void upload_heat_texture(FileTab &tab, LoadedDataset &data) {
     data.rgba.shrink_to_fit();
 }
 
-void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, float min_value, float max_value) {
-    if (data.kind != LoadedKind::Heatmap2D || data.heat_values.empty() || tab.heat_texture == 0) {
+void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, const std::vector<float> &values,
+                                int value_generation, float min_value, float max_value) {
+    if (data.kind != LoadedKind::Heatmap2D || values.empty() || tab.heat_texture == 0) {
         return;
     }
     const auto nearly_same = [](float lhs, float rhs) {
         const float scale = std::max({1.0f, std::abs(lhs), std::abs(rhs)});
         return std::abs(lhs - rhs) <= scale * 1e-5f;
     };
-    if (std::isfinite(data.applied_color_min) && std::isfinite(data.applied_color_max) &&
+    if (data.applied_color_generation == value_generation && std::isfinite(data.applied_color_min) &&
+        std::isfinite(data.applied_color_max) &&
         nearly_same(data.applied_color_min, min_value) && nearly_same(data.applied_color_max, max_value)) {
         return;
     }
 
-    std::vector<uint8_t> rgba = make_turbo_rgba(data.heat_values, min_value, max_value);
+    std::vector<uint8_t> rgba = make_turbo_rgba(values, min_value, max_value);
     glBindTexture(GL_TEXTURE_2D, tab.heat_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, data.texture_width, data.texture_height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     glBindTexture(GL_TEXTURE_2D, 0);
     data.applied_color_min = min_value;
     data.applied_color_max = max_value;
+    data.applied_color_generation = value_generation;
 }
 
 void invalidate_plot(FileTab &tab) {
     tab.loaded.reset();
-    tab.line_cache = {};
+    clear_filter_output_for_new_data(tab);
     tab.loading_quiet = false;
     tab.loading_preserve_controls = false;
     delete_heat_texture(tab);
@@ -1998,20 +2709,21 @@ PlotControls preserved_controls_for_reload(const FileTab &tab) {
     }
 
     const LoadedDataset &data = *tab.loaded;
+    const auto [display_min, display_max] = displayed_value_range(tab, data);
     if (controls.x.automatic) {
-        controls.x.min = data.x_min;
-        controls.x.max = data.x_max;
+        controls.x.min = displayed_x_min(tab, data);
+        controls.x.max = displayed_x_max(tab, data);
     }
     if (controls.y.automatic) {
-        controls.y.min = data.kind == LoadedKind::Line1D ? data.value_min : data.y_min;
-        controls.y.max = data.kind == LoadedKind::Line1D ? data.value_max : data.y_max;
+        controls.y.min = data.kind == LoadedKind::Line1D ? display_min : displayed_y_min(tab, data);
+        controls.y.max = data.kind == LoadedKind::Line1D ? display_max : displayed_y_max(tab, data);
     }
     if (data.kind == LoadedKind::Heatmap2D) {
         if (controls.color.auto_min) {
-            controls.color.min = data.value_min;
+            controls.color.min = display_min;
         }
         if (controls.color.auto_max) {
-            controls.color.max = data.value_max;
+            controls.color.max = display_max;
         }
     }
     normalize_range(controls.x.min, controls.x.max);
@@ -2019,9 +2731,9 @@ PlotControls preserved_controls_for_reload(const FileTab &tab) {
     return controls;
 }
 
-std::pair<float, float> effective_color_range(const ColorRangeControl &control, const LoadedDataset &data) {
-    const double raw_min = control.auto_min ? static_cast<double>(data.value_min) : control.min;
-    const double raw_max = control.auto_max ? static_cast<double>(data.value_max) : control.max;
+std::pair<float, float> effective_color_range(const ColorRangeControl &control, float auto_min, float auto_max) {
+    const double raw_min = control.auto_min ? static_cast<double>(auto_min) : control.min;
+    const double raw_max = control.auto_max ? static_cast<double>(auto_max) : control.max;
     const auto [min_value, max_value] = effective_range(raw_min, raw_max);
     return {static_cast<float>(min_value), static_cast<float>(max_value)};
 }
@@ -2077,6 +2789,17 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
             has_x_axis_info = true;
         }
     }
+    DatasetInfo y_axis_info;
+    bool has_y_axis_info = false;
+    if (info.dims.size() == 2 && !y_axis.path.empty()) {
+        auto it = std::find_if(tab.datasets.begin(), tab.datasets.end(), [&](const DatasetInfo &candidate) {
+            return candidate.path == y_axis.path;
+        });
+        if (it != tab.datasets.end() && vector_axis_length(*it) == y_fallback_count) {
+            y_axis_info = *it;
+            has_y_axis_info = true;
+        }
+    }
 
     const int token = ++tab.load_token;
     LoadConfig config;
@@ -2096,7 +2819,7 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
     }
     tab.error.clear();
     tab.load_future = std::async(std::launch::async, load_dataset_worker, token, tab.current_file, info, x_axis, y_axis,
-                                 x_axis_info, has_x_axis_info, config);
+                                 x_axis_info, has_x_axis_info, y_axis_info, has_y_axis_info, config);
 }
 
 bool poll_load(FileTab &tab) {
@@ -2137,12 +2860,17 @@ bool poll_load(FileTab &tab) {
         } else {
             reset_controls_from_data(tab, *tab.loaded);
         }
+        clear_filter_output_for_new_data(tab, preserve_controls);
     }
     if (tab.loaded && tab.loaded->kind == LoadedKind::Heatmap2D) {
+        clamp_slice_state(tab, *tab.loaded);
         upload_heat_texture(tab, *tab.loaded);
         if (preserve_controls && (!tab.controls.color.auto_min || !tab.controls.color.auto_max)) {
-            const auto [color_min, color_max] = effective_color_range(tab.controls.color, *tab.loaded);
-            update_heat_texture_colors(tab, *tab.loaded, color_min, color_max);
+            const auto [display_min, display_max] = displayed_value_range(tab, *tab.loaded);
+            const auto [color_min, color_max] =
+                effective_color_range(tab.controls.color, display_min, display_max);
+            update_heat_texture_colors(tab, *tab.loaded, displayed_plot_values(tab, *tab.loaded),
+                                       displayed_value_generation(tab, *tab.loaded), color_min, color_max);
         }
     }
     if (!quiet_load) {
@@ -2167,6 +2895,7 @@ void open_file_in_tab(AppState &app, FileTab &tab, const std::string &path) {
     tab.x_axis_index = -2;
     tab.y_axis_index = -2;
     tab.transpose_2d = false;
+    tab.slices = {};
     tab.caption.clear();
     tab.swmr_available = false;
     tab.live_swmr_enabled = false;
@@ -2354,19 +3083,20 @@ bool poll_swmr_live(AppState &app, FileTab &tab) {
     return true;
 }
 
-double x_at_index(const LoadedDataset &data, size_t index, size_t source_size) {
-    if (!data.line_x_values.empty() && index < data.line_x_values.size()) {
-        return data.line_x_values[index];
+double x_at_index(const std::vector<double> &x_values, size_t index, size_t source_size, double x_min, double x_max) {
+    if (!x_values.empty() && index < x_values.size()) {
+        return x_values[index];
     }
-    if (source_size <= 1 || data.x_max == data.x_min) {
+    if (source_size <= 1 || x_max == x_min) {
         return static_cast<double>(index);
     }
     const double t = static_cast<double>(index) / static_cast<double>(source_size - 1);
-    return data.x_min + t * (data.x_max - data.x_min);
+    return x_min + t * (x_max - x_min);
 }
 
-void rebuild_line_cache(const LoadedDataset &data, LineCache &cache, double view_min, double view_max, int pixel_width) {
-    const std::vector<float> &values = data.line_values;
+void rebuild_line_cache(const std::vector<float> &values, const std::vector<double> &x_values, bool x_increasing,
+                        bool x_decreasing, double x_min, double x_max, LineCache &cache, double view_min,
+                        double view_max, int pixel_width) {
     const size_t n = values.size();
     if (n == 0) {
         cache = {};
@@ -2379,8 +3109,8 @@ void rebuild_line_cache(const LoadedDataset &data, LineCache &cache, double view
     }
     pixel_width = std::max(64, pixel_width);
 
-    const double data_min = std::min(data.x_min, data.x_max);
-    const double data_max = std::max(data.x_min, data.x_max);
+    const double data_min = std::min(x_min, x_max);
+    const double data_max = std::max(x_min, x_max);
     view_min = std::clamp(view_min, data_min, data_max);
     view_max = std::clamp(view_max, data_min, data_max);
     if (view_min > view_max) {
@@ -2394,8 +3124,8 @@ void rebuild_line_cache(const LoadedDataset &data, LineCache &cache, double view
     };
 
     const bool cache_hit = cache.valid && cache.source_ptr == values.data() && cache.source_size == n &&
-                           cache.x_source_ptr == (data.line_x_values.empty() ? nullptr : data.line_x_values.data()) &&
-                           cache.data_x_min == data.x_min && cache.data_x_max == data.x_max &&
+                           cache.x_source_ptr == (x_values.empty() ? nullptr : x_values.data()) &&
+                           cache.data_x_min == x_min && cache.data_x_max == x_max &&
                            nearly_same(cache.view_x_min, view_min) && nearly_same(cache.view_x_max, view_max) &&
                            cache.pixel_width == pixel_width;
     if (cache_hit) {
@@ -2405,33 +3135,33 @@ void rebuild_line_cache(const LoadedDataset &data, LineCache &cache, double view
     cache = {};
     cache.valid = true;
     cache.source_ptr = values.data();
-    cache.x_source_ptr = data.line_x_values.empty() ? nullptr : data.line_x_values.data();
+    cache.x_source_ptr = x_values.empty() ? nullptr : x_values.data();
     cache.source_size = n;
-    cache.data_x_min = data.x_min;
-    cache.data_x_max = data.x_max;
+    cache.data_x_min = x_min;
+    cache.data_x_max = x_max;
     cache.view_x_min = view_min;
     cache.view_x_max = view_max;
     cache.pixel_width = pixel_width;
 
     const auto index_for_x = [&](double x) -> size_t {
-        if (!data.line_x_values.empty() && data.x_values_increasing) {
-            auto it = std::lower_bound(data.line_x_values.begin(), data.line_x_values.end(), x);
-            if (it == data.line_x_values.end()) {
+        if (!x_values.empty() && x_increasing) {
+            auto it = std::lower_bound(x_values.begin(), x_values.end(), x);
+            if (it == x_values.end()) {
                 return n - 1;
             }
-            return static_cast<size_t>(std::distance(data.line_x_values.begin(), it));
+            return static_cast<size_t>(std::distance(x_values.begin(), it));
         }
-        if (!data.line_x_values.empty() && data.x_values_decreasing) {
-            auto it = std::lower_bound(data.line_x_values.begin(), data.line_x_values.end(), x, std::greater<double>());
-            if (it == data.line_x_values.end()) {
+        if (!x_values.empty() && x_decreasing) {
+            auto it = std::lower_bound(x_values.begin(), x_values.end(), x, std::greater<double>());
+            if (it == x_values.end()) {
                 return n - 1;
             }
-            return static_cast<size_t>(std::distance(data.line_x_values.begin(), it));
+            return static_cast<size_t>(std::distance(x_values.begin(), it));
         }
-        if (data.x_max == data.x_min || n <= 1) {
+        if (x_max == x_min || n <= 1) {
             return 0;
         }
-        const double t = (x - data.x_min) / (data.x_max - data.x_min);
+        const double t = (x - x_min) / (x_max - x_min);
         const double clamped = std::clamp(t, 0.0, 1.0);
         return static_cast<size_t>(std::floor(clamped * static_cast<double>(n - 1)));
     };
@@ -2450,7 +3180,7 @@ void rebuild_line_cache(const LoadedDataset &data, LineCache &cache, double view
         cache.y.resize(visible_count);
         for (size_t i = 0; i < visible_count; ++i) {
             const size_t source_index = first + i;
-            cache.x[i] = x_at_index(data, source_index, n);
+            cache.x[i] = x_at_index(x_values, source_index, n, x_min, x_max);
             cache.y[i] = values[source_index];
         }
         return;
@@ -2477,7 +3207,7 @@ void rebuild_line_cache(const LoadedDataset &data, LineCache &cache, double view
                 min_value = 0.0f;
                 max_value = 0.0f;
             }
-            const double x = x_at_index(data, std::min(a, n - 1), n);
+            const double x = x_at_index(x_values, std::min(a, n - 1), n, x_min, x_max);
             cache.x[bin * 2 + 0] = x;
             cache.y[bin * 2 + 0] = min_value;
             cache.x[bin * 2 + 1] = x;
@@ -2494,6 +3224,155 @@ ImVec4 high_contrast_line_color(int salt) {
         ImVec4(0.96f, 0.96f, 0.96f, 1.0f), ImVec4(0.30f, 0.68f, 1.00f, 1.0f),
     };
     return colors[static_cast<size_t>(std::abs(salt)) % colors.size()];
+}
+
+bool heatmap_slice_ready(const LoadedDataset &data) {
+    return data.kind == LoadedKind::Heatmap2D && data.texture_width > 0 && data.texture_height > 0 &&
+           data.heat_values.size() == static_cast<size_t>(data.texture_width) * static_cast<size_t>(data.texture_height);
+}
+
+void clamp_slice_state(FileTab &tab, const LoadedDataset &data) {
+    if (!heatmap_slice_ready(data)) {
+        tab.slices.row_index = 0;
+        tab.slices.column_index = 0;
+        return;
+    }
+    tab.slices.row_index = std::clamp(tab.slices.row_index, 0, data.texture_height - 1);
+    tab.slices.column_index = std::clamp(tab.slices.column_index, 0, data.texture_width - 1);
+}
+
+double coordinate_for_index(int index, double axis_min, double axis_max, int count) {
+    if (count <= 1 || axis_min == axis_max) {
+        return axis_min;
+    }
+    const double t = static_cast<double>(std::clamp(index, 0, count - 1)) / static_cast<double>(count - 1);
+    return axis_min + t * (axis_max - axis_min);
+}
+
+int index_for_coordinate(double coordinate, double axis_min, double axis_max, int count) {
+    if (count <= 1 || axis_min == axis_max || !std::isfinite(coordinate)) {
+        return 0;
+    }
+    const double t = (coordinate - axis_min) / (axis_max - axis_min);
+    const double clamped = std::clamp(std::isfinite(t) ? t : 0.0, 0.0, 1.0);
+    return std::clamp(static_cast<int>(std::llround(clamped * static_cast<double>(count - 1))), 0, count - 1);
+}
+
+bool can_plot_axis_values(const std::vector<double> &values, int count) {
+    return values.size() == static_cast<size_t>(count) && is_monotonic_increasing(values);
+}
+
+void remember_heatmap_view(FileTab &tab, const ImPlotRect &limits) {
+    tab.slices.view_x_min = limits.X.Min;
+    tab.slices.view_x_max = limits.X.Max;
+    tab.slices.view_y_min = limits.Y.Min;
+    tab.slices.view_y_max = limits.Y.Max;
+    tab.slices.heatmap_view_valid = std::isfinite(tab.slices.view_x_min) && std::isfinite(tab.slices.view_x_max) &&
+                                    std::isfinite(tab.slices.view_y_min) && std::isfinite(tab.slices.view_y_max);
+}
+
+std::pair<double, double> slice_axis_view_range(const SliceState &slices, double axis_min, double axis_max,
+                                                bool row_slice) {
+    double min_value = axis_min;
+    double max_value = axis_max;
+    if (slices.heatmap_view_valid) {
+        min_value = row_slice ? slices.view_x_min : slices.view_y_min;
+        max_value = row_slice ? slices.view_x_max : slices.view_y_max;
+    }
+    return effective_range(min_value, max_value);
+}
+
+std::pair<double, double> visible_slice_value_range(const std::vector<double> &x, const std::vector<double> &y,
+                                                    double view_min, double view_max) {
+    if (view_min > view_max) {
+        std::swap(view_min, view_max);
+    }
+
+    double min_value = std::numeric_limits<double>::infinity();
+    double max_value = -std::numeric_limits<double>::infinity();
+    double closest_distance = std::numeric_limits<double>::infinity();
+    double closest_value = std::numeric_limits<double>::quiet_NaN();
+    const double view_center = 0.5 * (view_min + view_max);
+    for (size_t i = 0; i < x.size() && i < y.size(); ++i) {
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) {
+            continue;
+        }
+        const double distance = std::abs(x[i] - view_center);
+        if (distance < closest_distance) {
+            closest_distance = distance;
+            closest_value = y[i];
+        }
+        if (x[i] < view_min || x[i] > view_max) {
+            continue;
+        }
+        min_value = std::min(min_value, y[i]);
+        max_value = std::max(max_value, y[i]);
+    }
+
+    if (!std::isfinite(min_value) || !std::isfinite(max_value)) {
+        if (!std::isfinite(closest_value)) {
+            return finite_minmax(y);
+        }
+        min_value = closest_value;
+        max_value = closest_value;
+    }
+    normalize_range(min_value, max_value);
+    return {min_value, max_value};
+}
+
+hsize_t display_row_source_index(const FileTab &tab, const LoadedDataset &data) {
+    if (tab.transpose_2d) {
+        return static_cast<hsize_t>(hdf5_plotter::preview_source_index(
+            static_cast<size_t>(tab.slices.row_index), static_cast<size_t>(data.col_stride),
+            static_cast<size_t>(data.source_cols)));
+    }
+    return static_cast<hsize_t>(hdf5_plotter::preview_source_index(
+        static_cast<size_t>(tab.slices.row_index), static_cast<size_t>(data.row_stride),
+        static_cast<size_t>(data.source_rows)));
+}
+
+hsize_t display_column_source_index(const FileTab &tab, const LoadedDataset &data) {
+    if (tab.transpose_2d) {
+        return static_cast<hsize_t>(hdf5_plotter::preview_source_index(
+            static_cast<size_t>(tab.slices.column_index), static_cast<size_t>(data.row_stride),
+            static_cast<size_t>(data.source_rows)));
+    }
+    return static_cast<hsize_t>(hdf5_plotter::preview_source_index(
+        static_cast<size_t>(tab.slices.column_index), static_cast<size_t>(data.col_stride),
+        static_cast<size_t>(data.source_cols)));
+}
+
+void build_row_slice(const LoadedDataset &data, const std::vector<float> &values,
+                     const std::vector<double> &axis_values, double axis_min, double axis_max, int row_index,
+                     std::vector<double> &x, std::vector<double> &y) {
+    const int width = std::max(0, data.texture_width);
+    x.resize(static_cast<size_t>(width));
+    y.resize(static_cast<size_t>(width));
+    const int row = std::clamp(row_index, 0, std::max(0, data.texture_height - 1));
+    const bool use_axis_values = can_plot_axis_values(axis_values, width);
+    for (int col = 0; col < width; ++col) {
+        x[static_cast<size_t>(col)] = use_axis_values ? axis_values[static_cast<size_t>(col)]
+                                                     : coordinate_for_index(col, axis_min, axis_max, width);
+        y[static_cast<size_t>(col)] =
+            static_cast<double>(values[static_cast<size_t>(row) * static_cast<size_t>(width) + static_cast<size_t>(col)]);
+    }
+}
+
+void build_column_slice(const LoadedDataset &data, const std::vector<float> &values,
+                        const std::vector<double> &axis_values, double axis_min, double axis_max, int column_index,
+                        std::vector<double> &x, std::vector<double> &y) {
+    const int height = std::max(0, data.texture_height);
+    const int width = std::max(0, data.texture_width);
+    x.resize(static_cast<size_t>(height));
+    y.resize(static_cast<size_t>(height));
+    const int column = std::clamp(column_index, 0, std::max(0, width - 1));
+    const bool use_axis_values = can_plot_axis_values(axis_values, height);
+    for (int row = 0; row < height; ++row) {
+        x[static_cast<size_t>(row)] = use_axis_values ? axis_values[static_cast<size_t>(row)]
+                                                     : coordinate_for_index(row, axis_min, axis_max, height);
+        y[static_cast<size_t>(row)] =
+            static_cast<double>(values[static_cast<size_t>(row) * static_cast<size_t>(width) + static_cast<size_t>(column)]);
+    }
 }
 
 void draw_color_strip(float min_value, float max_value) {
@@ -2579,6 +3458,63 @@ void draw_color_range_control(ColorRangeControl &range, double auto_min, double 
     ImGui::InputDouble("##color-max", &range.max, 0.0, 0.0, "%.6g");
     ImGui::EndDisabled();
     ImGui::PopID();
+}
+
+void draw_slice_controls(FileTab &tab, LoadedDataset &data) {
+    if (!heatmap_slice_ready(data)) {
+        return;
+    }
+
+    bool enabled = tab.slices.enabled;
+    if (ImGui::Checkbox("Slice plots", &enabled)) {
+        tab.slices.enabled = enabled;
+        if (enabled) {
+            tab.slices.row_window_open = true;
+            tab.slices.column_window_open = true;
+            clamp_slice_state(tab, data);
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Open dockable row/column slice plots. Click or drag visible guides to choose indices.");
+    }
+
+    if (!tab.slices.enabled) {
+        return;
+    }
+
+    clamp_slice_state(tab, data);
+    ImGui::SameLine();
+    ImGui::TextDisabled("click visible guides or type indices");
+
+    const float input_width = ImGui::CalcTextSize("88888888").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    int row = tab.slices.row_index;
+    ImGui::SetNextItemWidth(input_width);
+    if (ImGui::InputInt("Row", &row, 1, 10)) {
+        tab.slices.row_index = std::clamp(row, 0, data.texture_height - 1);
+    }
+    ImGui::SameLine();
+    int column = tab.slices.column_index;
+    ImGui::SetNextItemWidth(input_width);
+    if (ImGui::InputInt("Column", &column, 1, 10)) {
+        tab.slices.column_index = std::clamp(column, 0, data.texture_width - 1);
+    }
+
+    ImGui::Checkbox("Row window", &tab.slices.row_window_open);
+    ImGui::SameLine();
+    ImGui::Checkbox("Column window", &tab.slices.column_window_open);
+    if (displayed_x_axis_overridden(tab, data) || displayed_y_axis_overridden(tab, data)) {
+        ImGui::TextDisabled("Row %.6g; column %.6g",
+                            coordinate_for_index(tab.slices.row_index, displayed_y_min(tab, data),
+                                                 displayed_y_max(tab, data), data.texture_height),
+                            coordinate_for_index(tab.slices.column_index, displayed_x_min(tab, data),
+                                                 displayed_x_max(tab, data), data.texture_width));
+    } else {
+        ImGui::TextDisabled("Preview row %d -> source %s %s; preview column %d -> source %s %s",
+                            tab.slices.row_index, tab.transpose_2d ? "column" : "row",
+                            count_label(display_row_source_index(tab, data)).c_str(), tab.slices.column_index,
+                            tab.transpose_2d ? "row" : "column",
+                            count_label(display_column_source_index(tab, data)).c_str());
+    }
 }
 
 void draw_axis_combo(AppState &app, FileTab &tab, const char *label, int &axis_index,
@@ -2802,20 +3738,69 @@ void draw_plot_controls(FileTab &tab, LoadedDataset &data) {
     }
 
     if (ImGui::CollapsingHeader("Scaling", ImGuiTreeNodeFlags_DefaultOpen)) {
-        draw_range_control("Auto X", tab.controls.x, data.x_min, data.x_max);
-        const double y_auto_min = data.kind == LoadedKind::Line1D ? data.value_min : data.y_min;
-        const double y_auto_max = data.kind == LoadedKind::Line1D ? data.value_max : data.y_max;
+        const auto [display_min, display_max] = displayed_value_range(tab, data);
+        draw_range_control("Auto X", tab.controls.x, displayed_x_min(tab, data), displayed_x_max(tab, data));
+        const double y_auto_min = data.kind == LoadedKind::Line1D ? display_min : displayed_y_min(tab, data);
+        const double y_auto_max = data.kind == LoadedKind::Line1D ? display_max : displayed_y_max(tab, data);
         draw_range_control("Auto Y", tab.controls.y, y_auto_min, y_auto_max);
         if (data.kind == LoadedKind::Heatmap2D) {
-            draw_color_range_control(tab.controls.color, data.value_min, data.value_max);
+            draw_color_range_control(tab.controls.color, display_min, display_max);
+            draw_slice_controls(tab, data);
         }
-        if (looks_like_unix_time_axis(data)) {
+        if (!displayed_x_axis_overridden(tab, data) && looks_like_unix_time_axis(data)) {
             ImGui::Checkbox("Format X as date/time", &tab.x_datetime);
             if (tab.x_datetime) {
                 ImGui::SameLine();
                 ImGui::Checkbox("UTC", &tab.x_datetime_utc);
             }
         }
+    }
+}
+
+void draw_heatmap_slice_overlay(FileTab &tab, LoadedDataset &data) {
+    if (!tab.slices.enabled || !heatmap_slice_ready(data)) {
+        return;
+    }
+
+    clamp_slice_state(tab, data);
+    const double x_min = displayed_x_min(tab, data);
+    const double x_max = displayed_x_max(tab, data);
+    const double y_min = displayed_y_min(tab, data);
+    const double y_max = displayed_y_max(tab, data);
+    const bool show_row_slice = tab.slices.row_window_open;
+    const bool show_column_slice = tab.slices.column_window_open;
+    if (ImPlot::IsPlotHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const ImPlotPoint mouse = ImPlot::GetPlotMousePos();
+        if (show_column_slice) {
+            tab.slices.column_index = index_for_coordinate(mouse.x, x_min, x_max, data.texture_width);
+        }
+        if (show_row_slice) {
+            tab.slices.row_index = index_for_coordinate(mouse.y, y_min, y_max, data.texture_height);
+        }
+    }
+
+    double slice_x = coordinate_for_index(tab.slices.column_index, x_min, x_max, data.texture_width);
+    double slice_y = coordinate_for_index(tab.slices.row_index, y_min, y_max, data.texture_height);
+    const ImVec4 column_color(1.0f, 0.88f, 0.10f, 1.0f);
+    const ImVec4 row_color(0.10f, 0.95f, 1.0f, 1.0f);
+    const ImPlotDragToolFlags flags = ImPlotDragToolFlags_NoFit;
+
+    if (show_column_slice && ImPlot::DragLineX(10000 + tab.id * 2, &slice_x, column_color, 1.5f, flags)) {
+        tab.slices.column_index = index_for_coordinate(slice_x, x_min, x_max, data.texture_width);
+    }
+    if (show_row_slice && ImPlot::DragLineY(10001 + tab.id * 2, &slice_y, row_color, 1.5f, flags)) {
+        tab.slices.row_index = index_for_coordinate(slice_y, y_min, y_max, data.texture_height);
+    }
+
+    if (show_column_slice) {
+        const std::string source_index = count_label(display_column_source_index(tab, data));
+        ImPlot::TagX(coordinate_for_index(tab.slices.column_index, x_min, x_max, data.texture_width), column_color,
+                     "%s %s", tab.transpose_2d ? "row" : "column", source_index.c_str());
+    }
+    if (show_row_slice) {
+        const std::string source_index = count_label(display_row_source_index(tab, data));
+        ImPlot::TagY(coordinate_for_index(tab.slices.row_index, y_min, y_max, data.texture_height), row_color,
+                     "%s %s", tab.transpose_2d ? "column" : "row", source_index.c_str());
     }
 }
 
@@ -2857,6 +3842,11 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
     ImGui::Separator();
 
     if (data.kind == LoadedKind::Line1D) {
+        const std::vector<float> &plot_values = displayed_plot_values(tab, data);
+        const std::vector<double> &x_values = displayed_line_x_values(tab, data);
+        const double x_min = displayed_x_min(tab, data);
+        const double x_max = displayed_x_max(tab, data);
+        const bool x_overridden = displayed_x_axis_overridden(tab, data);
         const int plot_width = static_cast<int>(std::max(64.0f, ImGui::GetContentRegionAvail().x));
         if (tab.controls.x.automatic) {
             ImPlot::SetNextAxisToFit(ImAxis_X1);
@@ -2869,13 +3859,17 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
             ImPlot::SetNextAxisLinks(ImAxis_Y1, &tab.controls.y.min, &tab.controls.y.max);
         }
         if (ImPlot::BeginPlot("##line", ImVec2(-1, -1))) {
-            ImPlot::SetupAxes(data.x_label.c_str(), data.y_label.c_str());
+            ImPlot::SetupAxes(displayed_x_label(tab, data).c_str(), displayed_value_label(tab, data).c_str());
             AxisValueFormatterData x_formatter;
-            setup_x_axis_format(tab, data, x_formatter);
+            if (!x_overridden) {
+                setup_x_axis_format(tab, data, x_formatter);
+            }
             const ImPlotRect limits = ImPlot::GetPlotLimits();
-            const double cache_min = tab.controls.x.automatic ? data.x_min : limits.X.Min;
-            const double cache_max = tab.controls.x.automatic ? data.x_max : limits.X.Max;
-            rebuild_line_cache(data, tab.line_cache, cache_min, cache_max, plot_width);
+            const double cache_min = tab.controls.x.automatic ? x_min : limits.X.Min;
+            const double cache_max = tab.controls.x.automatic ? x_max : limits.X.Max;
+            rebuild_line_cache(plot_values, x_values, x_overridden || data.x_values_increasing,
+                               !x_overridden && data.x_values_decreasing, x_min, x_max, tab.line_cache, cache_min,
+                               cache_max, plot_width);
             if (!tab.line_cache.x.empty()) {
                 ImPlot::SetNextLineStyle(high_contrast_line_color(tab.selected_index), 1.8f);
                 ImPlot::PlotLine(base_name(data.info.path).c_str(), tab.line_cache.x.data(), tab.line_cache.y.data(),
@@ -2887,8 +3881,17 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
     }
 
     if (data.kind == LoadedKind::Heatmap2D) {
-        const auto [color_min, color_max] = effective_color_range(tab.controls.color, data);
-        update_heat_texture_colors(tab, data, color_min, color_max);
+        const std::vector<float> &plot_values = displayed_plot_values(tab, data);
+        const double x_min = displayed_x_min(tab, data);
+        const double x_max = displayed_x_max(tab, data);
+        const double y_min = displayed_y_min(tab, data);
+        const double y_max = displayed_y_max(tab, data);
+        const auto [display_min, display_max] = displayed_value_range(tab, data);
+        const auto [color_min, color_max] = effective_color_range(tab.controls.color, display_min, display_max);
+        update_heat_texture_colors(tab, data, plot_values, displayed_value_generation(tab, data), color_min, color_max);
+        if (filter_output_ready(tab, data) && !tab.filters.value_label.empty()) {
+            ImGui::TextUnformatted(tab.filters.value_label.c_str());
+        }
         ImGui::Text("Turbo texture: %d x %d from %s x %s cells, range %.6g to %.6g", data.texture_width,
                     data.texture_height, count_label(data.source_rows).c_str(), count_label(data.source_cols).c_str(),
                     static_cast<double>(color_min), static_cast<double>(color_max));
@@ -2906,12 +3909,19 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
         }
 
         if (tab.heat_texture != 0 && ImPlot::BeginPlot("##heatmap", ImVec2(-1, -1))) {
-            ImPlot::SetupAxes(data.x_label.c_str(), data.y_label.c_str());
+            ImPlot::SetupAxes(displayed_x_label(tab, data).c_str(), displayed_y_label(tab, data).c_str());
             AxisValueFormatterData x_formatter;
-            setup_x_axis_format(tab, data, x_formatter);
+            AxisValueFormatterData y_formatter;
+            if (!displayed_x_axis_overridden(tab, data)) {
+                setup_x_axis_format(tab, data, x_formatter);
+            }
+            if (!displayed_y_axis_overridden(tab, data)) {
+                setup_y_axis_format(data, ImAxis_Y1, y_formatter);
+            }
             ImPlot::PlotImage(base_name(data.info.path).c_str(), reinterpret_cast<ImTextureID>(static_cast<intptr_t>(tab.heat_texture)),
-                              ImPlotPoint(data.x_min, data.y_min), ImPlotPoint(data.x_max, data.y_max), ImVec2(0, 1),
-                              ImVec2(1, 0));
+                              ImPlotPoint(x_min, y_min), ImPlotPoint(x_max, y_max), ImVec2(0, 1), ImVec2(1, 0));
+            remember_heatmap_view(tab, ImPlot::GetPlotLimits());
+            draw_heatmap_slice_overlay(tab, data);
             ImPlot::EndPlot();
         }
     }
@@ -2926,6 +3936,151 @@ std::string tab_title(const FileTab &tab) {
 
 std::string plot_window_title(const FileTab &tab) {
     return "Plot: " + tab_title(tab) + "##plot-" + std::to_string(tab.id);
+}
+
+std::string row_slice_window_title(const FileTab &tab) {
+    return "Row Slice: " + tab_title(tab) + "##row-slice-" + std::to_string(tab.id);
+}
+
+std::string column_slice_window_title(const FileTab &tab) {
+    return "Column Slice: " + tab_title(tab) + "##column-slice-" + std::to_string(tab.id);
+}
+
+void draw_slice_line_plot(FileTab &tab, LoadedDataset &data, bool row_slice) {
+    if (!heatmap_slice_ready(data)) {
+        ImGui::TextUnformatted("No 2D preview is loaded.");
+        return;
+    }
+
+    clamp_slice_state(tab, data);
+    const float input_width = ImGui::CalcTextSize("88888888").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    if (row_slice) {
+        int row = tab.slices.row_index;
+        ImGui::SetNextItemWidth(input_width);
+        if (ImGui::InputInt("Row", &row, 1, 10)) {
+            tab.slices.row_index = std::clamp(row, 0, data.texture_height - 1);
+        }
+        ImGui::SameLine();
+        if (displayed_y_axis_overridden(tab, data)) {
+            ImGui::TextDisabled("%.6g",
+                                coordinate_for_index(tab.slices.row_index, displayed_y_min(tab, data),
+                                                     displayed_y_max(tab, data), data.texture_height));
+        } else {
+            ImGui::TextDisabled("source %s %s", tab.transpose_2d ? "column" : "row",
+                                count_label(display_row_source_index(tab, data)).c_str());
+        }
+    } else {
+        int column = tab.slices.column_index;
+        ImGui::SetNextItemWidth(input_width);
+        if (ImGui::InputInt("Column", &column, 1, 10)) {
+            tab.slices.column_index = std::clamp(column, 0, data.texture_width - 1);
+        }
+        ImGui::SameLine();
+        if (displayed_x_axis_overridden(tab, data)) {
+            ImGui::TextDisabled("%.6g",
+                                coordinate_for_index(tab.slices.column_index, displayed_x_min(tab, data),
+                                                     displayed_x_max(tab, data), data.texture_width));
+        } else {
+            ImGui::TextDisabled("source %s %s", tab.transpose_2d ? "row" : "column",
+                                count_label(display_column_source_index(tab, data)).c_str());
+        }
+    }
+
+    std::vector<double> x;
+    std::vector<double> y;
+    const std::vector<float> &plot_values = displayed_plot_values(tab, data);
+    const std::vector<double> &axis_values =
+        row_slice ? displayed_heat_x_values(tab, data) : displayed_heat_y_values(tab, data);
+    const double axis_min = row_slice ? displayed_x_min(tab, data) : displayed_y_min(tab, data);
+    const double axis_max = row_slice ? displayed_x_max(tab, data) : displayed_y_max(tab, data);
+    if (row_slice) {
+        build_row_slice(data, plot_values, axis_values, axis_min, axis_max, tab.slices.row_index, x, y);
+    } else {
+        build_column_slice(data, plot_values, axis_values, axis_min, axis_max, tab.slices.column_index, x, y);
+    }
+    if (x.empty() || y.empty()) {
+        ImGui::TextUnformatted("Slice is empty.");
+        return;
+    }
+
+    const auto [view_min, view_max] = slice_axis_view_range(tab.slices, axis_min, axis_max, row_slice);
+    const auto [value_min, value_max] = visible_slice_value_range(x, y, view_min, view_max);
+    ImPlot::SetNextAxisLimits(ImAxis_X1, view_min, view_max, ImPlotCond_Always);
+    ImPlot::SetNextAxisLimits(ImAxis_Y1, value_min, value_max, ImPlotCond_Always);
+    const char *plot_id = row_slice ? "##row-slice-plot" : "##column-slice-plot";
+    if (ImPlot::BeginPlot(plot_id, ImVec2(-1, -1))) {
+        const std::string &x_label = row_slice ? displayed_x_label(tab, data) : displayed_y_label(tab, data);
+        ImPlot::SetupAxes(x_label.c_str(), displayed_value_label(tab, data).c_str());
+        AxisValueFormatterData x_formatter;
+        const bool row_uses_axis_values = row_slice && can_plot_axis_values(axis_values, data.texture_width);
+        const bool column_uses_axis_values =
+            !row_slice && can_plot_axis_values(axis_values, data.texture_height);
+        if (row_slice && !displayed_x_axis_overridden(tab, data) && !row_uses_axis_values) {
+            setup_x_axis_format(tab, data, x_formatter);
+        } else if (!row_slice && !displayed_y_axis_overridden(tab, data) &&
+                   !column_uses_axis_values) {
+            setup_y_axis_format(data, ImAxis_X1, x_formatter);
+        } else if (row_slice && !displayed_x_axis_overridden(tab, data) && tab.x_datetime &&
+                   looks_like_unix_time_axis(data)) {
+            ImPlot::SetupAxisFormat(ImAxis_X1, unix_time_formatter, &tab.x_datetime_utc);
+        }
+        ImPlot::SetNextLineStyle(row_slice ? ImVec4(0.10f, 0.95f, 1.0f, 1.0f) : ImVec4(1.0f, 0.88f, 0.10f, 1.0f),
+                                 1.8f);
+        ImPlot::PlotLine(row_slice ? "row" : "column", x.data(), y.data(), static_cast<int>(y.size()),
+                         ImPlotLineFlags_SkipNaN);
+        ImPlot::EndPlot();
+    }
+}
+
+void draw_slice_windows(AppState &app, FileTab &tab) {
+    if (!tab.slices.enabled || !tab.loaded || !heatmap_slice_ready(*tab.loaded)) {
+        return;
+    }
+
+    LoadedDataset &data = *tab.loaded;
+    constexpr ImGuiWindowFlags slice_window_flags = ImGuiWindowFlags_NoFocusOnAppearing;
+    bool slice_window_appeared = false;
+    if (app.plot_dock_id != 0) {
+        ImGui::SetNextWindowDockID(app.plot_dock_id, ImGuiCond_FirstUseEver);
+    }
+    ImGui::SetNextWindowSize(ImVec2(620, 300), ImGuiCond_FirstUseEver);
+    if (tab.slices.row_window_open) {
+        bool open = tab.slices.row_window_open;
+        const std::string title = row_slice_window_title(tab);
+        const bool visible = ImGui::Begin(title.c_str(), &open, slice_window_flags);
+        slice_window_appeared |= ImGui::IsWindowAppearing();
+        if (visible) {
+            if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+                app.active_tab_id = tab.id;
+            }
+            draw_slice_line_plot(tab, data, true);
+        }
+        ImGui::End();
+        tab.slices.row_window_open = open;
+    }
+
+    if (app.plot_dock_id != 0) {
+        ImGui::SetNextWindowDockID(app.plot_dock_id, ImGuiCond_FirstUseEver);
+    }
+    ImGui::SetNextWindowSize(ImVec2(620, 300), ImGuiCond_FirstUseEver);
+    if (tab.slices.column_window_open) {
+        bool open = tab.slices.column_window_open;
+        const std::string title = column_slice_window_title(tab);
+        const bool visible = ImGui::Begin(title.c_str(), &open, slice_window_flags);
+        slice_window_appeared |= ImGui::IsWindowAppearing();
+        if (visible) {
+            if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+                app.active_tab_id = tab.id;
+            }
+            draw_slice_line_plot(tab, data, false);
+        }
+        ImGui::End();
+        tab.slices.column_window_open = open;
+    }
+    if (slice_window_appeared) {
+        const std::string title = plot_window_title(tab);
+        ImGui::SetWindowFocus(title.c_str());
+    }
 }
 
 FileTab &create_tab(AppState &app) {
@@ -2947,6 +4102,445 @@ FileTab *find_tab(AppState &app, int id) {
     return nullptr;
 }
 
+bool supports_savitzky_golay(const FileTab &tab) {
+    if (!tab.loaded) {
+        return false;
+    }
+    const LoadedDataset &data = *tab.loaded;
+    if (data.kind == LoadedKind::Line1D) {
+        return data.line_values.size() >= 3;
+    }
+    return data.kind == LoadedKind::Heatmap2D && (data.texture_width >= 3 || data.texture_height >= 3);
+}
+
+bool supports_windowed_average(const FileTab &tab) {
+    return supports_savitzky_golay(tab);
+}
+
+bool supports_fft(const FileTab &tab) {
+    if (!tab.loaded) {
+        return false;
+    }
+    const LoadedDataset &data = *tab.loaded;
+    if (data.kind == LoadedKind::Line1D) {
+        return data.line_values.size() >= 2;
+    }
+    return data.kind == LoadedKind::Heatmap2D && (data.texture_width >= 2 || data.texture_height >= 2);
+}
+
+void restore_source_after_filters_disabled(FileTab &tab) {
+    if (!tab.loaded) {
+        return;
+    }
+    FilterPipelineState &filters = tab.filters;
+    const bool restore_x = filters.x_axis_override;
+    const bool restore_y = filters.y_axis_override;
+    filters.output_source.reset();
+    filters.output_values.clear();
+    filters.output_token = 0;
+    filters.x_axis_override = false;
+    filters.y_axis_override = false;
+    filters.x_axis_values.clear();
+    filters.y_axis_values.clear();
+    filters.x_label.clear();
+    filters.y_label.clear();
+    filters.value_label.clear();
+    filters.preserve_axis_controls_on_next_result = false;
+    if (restore_x) {
+        tab.controls.x.min = tab.loaded->x_min;
+        tab.controls.x.max = tab.loaded->x_max;
+        tab.controls.x.automatic = false;
+    }
+    if (restore_y && tab.loaded->kind == LoadedKind::Heatmap2D) {
+        tab.controls.y.min = tab.loaded->y_min;
+        tab.controls.y.max = tab.loaded->y_max;
+        tab.controls.y.automatic = false;
+    }
+    tab.slices.heatmap_view_valid = false;
+    tab.line_cache = {};
+}
+
+void set_filter_stage_enabled(FileTab &tab, PlotFilterStage &stage, bool enabled) {
+    if (stage.enabled == enabled) {
+        return;
+    }
+    stage.enabled = enabled;
+    if (enabled && tab.loaded) {
+        switch (stage.kind) {
+        case PlotFilterKind::SavitzkyGolay:
+            sanitize_savitzky_golay_parameters(*tab.loaded, stage.savitzky_golay);
+            break;
+        case PlotFilterKind::WindowedAverage:
+            sanitize_windowed_average_parameters(*tab.loaded, stage.windowed_average);
+            break;
+        case PlotFilterKind::Fft:
+            sanitize_fft_parameters(*tab.loaded, stage.fft);
+            break;
+        }
+    }
+    tab.line_cache = {};
+    request_filter_recompute(tab);
+    if (!filter_pipeline_enabled(tab.filters)) {
+        restore_source_after_filters_disabled(tab);
+    }
+}
+
+const char *filter_stage_name(PlotFilterKind kind) {
+    switch (kind) {
+    case PlotFilterKind::SavitzkyGolay:
+        return "Savitzky-Golay";
+    case PlotFilterKind::WindowedAverage:
+        return "Windowed Average";
+    case PlotFilterKind::Fft:
+        return "FFT";
+    }
+    return "Filter";
+}
+
+bool filter_stage_available(const FileTab &tab, PlotFilterKind kind) {
+    switch (kind) {
+    case PlotFilterKind::SavitzkyGolay:
+        return supports_savitzky_golay(tab);
+    case PlotFilterKind::WindowedAverage:
+        return supports_windowed_average(tab);
+    case PlotFilterKind::Fft:
+        return supports_fft(tab);
+    }
+    return false;
+}
+
+void draw_filter_pipeline_order(FileTab &tab) {
+    ImGui::SeparatorText("Pipeline order");
+
+    bool moved = false;
+    size_t move_from = 0;
+    size_t move_to = 0;
+    const float controls_width = ImGui::GetFrameHeight() * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+    if (ImGui::BeginTable("##filter-pipeline-order", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Order", ImGuiTableColumnFlags_WidthFixed, controls_width);
+        for (size_t index = 0; index < tab.filters.stages.size(); ++index) {
+            PlotFilterStage &stage = tab.filters.stages[index];
+            ImGui::PushID(static_cast<int>(stage.kind));
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+
+            bool enabled = stage.enabled;
+            const bool available = filter_stage_available(tab, stage.kind);
+            ImGui::BeginDisabled(!available && !stage.enabled);
+            if (ImGui::Checkbox(filter_stage_name(stage.kind), &enabled)) {
+                set_filter_stage_enabled(tab, stage, enabled);
+            }
+            ImGui::EndDisabled();
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::BeginDisabled(index == 0);
+            if (ImGui::ArrowButton("##earlier", ImGuiDir_Up)) {
+                move_from = index;
+                move_to = index - 1;
+                moved = true;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Move this stage earlier.");
+            }
+            ImGui::SameLine();
+
+            ImGui::BeginDisabled(index + 1 >= tab.filters.stages.size());
+            if (ImGui::ArrowButton("##later", ImGuiDir_Down)) {
+                move_from = index;
+                move_to = index + 1;
+                moved = true;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Move this stage later.");
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    if (moved) {
+        std::swap(tab.filters.stages[move_from], tab.filters.stages[move_to]);
+        tab.line_cache = {};
+        request_filter_recompute(tab);
+    }
+}
+
+void draw_main_menu_bar(AppState &app) {
+    if (!ImGui::BeginMainMenuBar()) {
+        return;
+    }
+    if (ImGui::BeginMenu("Filters")) {
+        FileTab *tab = find_tab(app, app.active_tab_id);
+        const bool available = tab != nullptr && supports_savitzky_golay(*tab);
+        if (ImGui::BeginMenu("Savitzky-Golay", available)) {
+            PlotFilterStage &stage = savitzky_golay_stage(tab->filters);
+            const bool enabled = stage.enabled;
+            if (ImGui::MenuItem("Enabled", nullptr, enabled)) {
+                set_filter_stage_enabled(*tab, stage, !enabled);
+                tab->filters.settings_open = true;
+            }
+            if (ImGui::MenuItem("Settings...")) {
+                tab->filters.settings_open = true;
+            }
+            ImGui::EndMenu();
+        }
+        if (!available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Select a 1D or 2D numeric dataset first.");
+        }
+
+        const bool average_available = tab != nullptr && supports_windowed_average(*tab);
+        if (ImGui::BeginMenu("Windowed Average", average_available)) {
+            PlotFilterStage &stage = windowed_average_stage(tab->filters);
+            const bool enabled = stage.enabled;
+            if (ImGui::MenuItem("Enabled", nullptr, enabled)) {
+                set_filter_stage_enabled(*tab, stage, !enabled);
+                tab->filters.settings_open = true;
+            }
+            if (ImGui::MenuItem("Settings...")) {
+                tab->filters.settings_open = true;
+            }
+            ImGui::EndMenu();
+        }
+        if (!average_available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Select a 1D or 2D numeric dataset first.");
+        }
+
+        const bool fft_available = tab != nullptr && supports_fft(*tab);
+        if (ImGui::BeginMenu("FFT", fft_available)) {
+            PlotFilterStage &stage = fft_stage(tab->filters);
+            const bool enabled = stage.enabled;
+            if (ImGui::MenuItem("Enabled", nullptr, enabled)) {
+                set_filter_stage_enabled(*tab, stage, !enabled);
+                tab->filters.settings_open = true;
+            }
+            if (ImGui::MenuItem("Settings...")) {
+                tab->filters.settings_open = true;
+            }
+            ImGui::EndMenu();
+        }
+        if (!fft_available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Select a 1D or 2D numeric dataset first.");
+        }
+        ImGui::EndMenu();
+    }
+    ImGui::EndMainMenuBar();
+}
+
+std::string filter_window_title(const FileTab &tab) {
+    return "Filters: " + tab_title(tab) + "##filters-" + std::to_string(tab.id);
+}
+
+void draw_filter_settings_window(AppState &app, FileTab &tab) {
+    if (!tab.filters.settings_open) {
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(430, 700), ImGuiCond_FirstUseEver);
+    bool open = tab.filters.settings_open;
+    const std::string title = filter_window_title(tab);
+    if (ImGui::Begin(title.c_str(), &open)) {
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+            app.active_tab_id = tab.id;
+        }
+
+        savitzky_golay_stage(tab.filters);
+        windowed_average_stage(tab.filters);
+        fft_stage(tab.filters);
+        draw_filter_pipeline_order(tab);
+
+        PlotFilterStage &stage = savitzky_golay_stage(tab.filters);
+        const bool available = supports_savitzky_golay(tab);
+        ImGui::PushID("savitzky-golay");
+        ImGui::SeparatorText("Savitzky-Golay settings");
+
+        if (!available || !tab.loaded) {
+            ImGui::TextDisabled("Select a 1D or 2D numeric dataset.");
+        } else {
+            hdf5_plotter::SavitzkyGolayParameters &parameters = stage.savitzky_golay;
+            sanitize_savitzky_golay_parameters(*tab.loaded, parameters);
+            bool changed = false;
+            const float input_width =
+                ImGui::CalcTextSize("8888888888").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+
+            ImGui::TextUnformatted("Axis");
+            ImGui::SameLine();
+            int axis = parameters.axis == hdf5_plotter::FilterAxis::X ? 0 : 1;
+            const bool x_available =
+                savitzky_golay_axis_length(*tab.loaded, hdf5_plotter::FilterAxis::X) >= 3;
+            const bool y_available = tab.loaded->kind == LoadedKind::Heatmap2D &&
+                                     savitzky_golay_axis_length(*tab.loaded,
+                                                               hdf5_plotter::FilterAxis::Y) >= 3;
+            ImGui::BeginDisabled(!x_available);
+            if (ImGui::RadioButton("X", &axis, 0)) {
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!y_available);
+            if (ImGui::RadioButton("Y", &axis, 1)) {
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            parameters.axis = axis == 0 ? hdf5_plotter::FilterAxis::X : hdf5_plotter::FilterAxis::Y;
+
+            ImGui::SetNextItemWidth(input_width);
+            changed |= ImGui::InputInt("Window size", &parameters.window_size, 2, 10);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Odd values from 3 to 501, limited by the selected axis length.");
+            }
+            ImGui::SetNextItemWidth(input_width);
+            changed |= ImGui::InputInt("Polynomial order", &parameters.polynomial_order, 1, 1);
+            ImGui::SetNextItemWidth(input_width);
+            changed |= ImGui::InputInt("Derivative order", &parameters.derivative_order, 1, 1);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Derivatives are calculated in sample-index units.");
+            }
+
+            if (sanitize_savitzky_golay_parameters(*tab.loaded, parameters)) {
+                changed = true;
+            }
+            if (changed && stage.enabled) {
+                request_filter_recompute(tab);
+            }
+        }
+
+        ImGui::PopID();
+
+        PlotFilterStage &average = windowed_average_stage(tab.filters);
+        const bool average_available = supports_windowed_average(tab);
+        ImGui::PushID("windowed-average");
+        ImGui::SeparatorText("Windowed Average settings");
+
+        if (!average_available || !tab.loaded) {
+            ImGui::TextDisabled("Select a 1D or 2D numeric dataset.");
+        } else {
+            hdf5_plotter::WindowedAverageParameters &parameters = average.windowed_average;
+            sanitize_windowed_average_parameters(*tab.loaded, parameters);
+            bool changed = false;
+            const float input_width =
+                ImGui::CalcTextSize("8888888888").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+
+            ImGui::TextUnformatted("Axis");
+            ImGui::SameLine();
+            int axis = parameters.axis == hdf5_plotter::FilterAxis::X ? 0 : 1;
+            const bool x_available =
+                windowed_average_axis_length(*tab.loaded, hdf5_plotter::FilterAxis::X) >= 3;
+            const bool y_available =
+                tab.loaded->kind == LoadedKind::Heatmap2D &&
+                windowed_average_axis_length(*tab.loaded, hdf5_plotter::FilterAxis::Y) >= 3;
+            ImGui::BeginDisabled(!x_available);
+            changed |= ImGui::RadioButton("X", &axis, 0);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!y_available);
+            changed |= ImGui::RadioButton("Y", &axis, 1);
+            ImGui::EndDisabled();
+            parameters.axis = axis == 0 ? hdf5_plotter::FilterAxis::X : hdf5_plotter::FilterAxis::Y;
+
+            ImGui::SetNextItemWidth(input_width);
+            changed |= ImGui::InputInt("Window size", &parameters.window_size, 2, 10);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Centered odd window, limited by the selected axis. Edges use available samples.");
+            }
+
+            if (sanitize_windowed_average_parameters(*tab.loaded, parameters)) {
+                changed = true;
+            }
+            if (changed && average.enabled) {
+                request_filter_recompute(tab);
+            }
+        }
+        ImGui::PopID();
+
+        PlotFilterStage &fft = fft_stage(tab.filters);
+        const bool fft_available = supports_fft(tab);
+        ImGui::PushID("fft");
+        ImGui::SeparatorText("FFT settings");
+
+        if (!fft_available || !tab.loaded) {
+            ImGui::TextDisabled("Select a 1D or 2D numeric dataset.");
+        } else {
+            hdf5_plotter::FftParameters &parameters = fft.fft;
+            sanitize_fft_parameters(*tab.loaded, parameters);
+            bool changed = false;
+
+            ImGui::TextUnformatted("Axis");
+            ImGui::SameLine();
+            int axis = parameters.axis == hdf5_plotter::FilterAxis::X ? 0 : 1;
+            const auto [width, height] = plot_value_dimensions(*tab.loaded);
+            ImGui::BeginDisabled(width < 2);
+            changed |= ImGui::RadioButton("X", &axis, 0);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(tab.loaded->kind == LoadedKind::Line1D || height < 2);
+            changed |= ImGui::RadioButton("Y", &axis, 1);
+            ImGui::EndDisabled();
+            parameters.axis = axis == 0 ? hdf5_plotter::FilterAxis::X : hdf5_plotter::FilterAxis::Y;
+
+            static const char *value_modes[] = {"Magnitude", "Power", "Phase", "Real", "Imaginary"};
+            int value_mode = static_cast<int>(parameters.value_mode);
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::Combo("Output", &value_mode, value_modes, IM_ARRAYSIZE(value_modes))) {
+                parameters.value_mode = static_cast<hdf5_plotter::FftValueMode>(value_mode);
+                changed = true;
+            }
+
+            static const char *windows[] = {"Rectangular", "Hann", "Hamming", "Blackman"};
+            int window = static_cast<int>(parameters.window);
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::Combo("Window", &window, windows, IM_ARRAYSIZE(windows))) {
+                parameters.window = static_cast<hdf5_plotter::FftWindow>(window);
+                changed = true;
+            }
+            changed |= ImGui::Checkbox("Remove mean", &parameters.remove_mean);
+            const bool supports_decibels = parameters.value_mode == hdf5_plotter::FftValueMode::Magnitude ||
+                                           parameters.value_mode == hdf5_plotter::FftValueMode::Power;
+            ImGui::BeginDisabled(!supports_decibels);
+            changed |= ImGui::Checkbox("Decibels", &parameters.decibels);
+            ImGui::EndDisabled();
+            if (!supports_decibels && parameters.decibels) {
+                parameters.decibels = false;
+                changed = true;
+            }
+            const AxisSampling automatic_sampling = fft_axis_sampling(*tab.loaded, parameters.axis);
+            const bool was_automatic_spacing = parameters.automatic_spacing;
+            if (ImGui::Checkbox("Auto sample spacing", &parameters.automatic_spacing)) {
+                if (was_automatic_spacing && !parameters.automatic_spacing) {
+                    parameters.sample_spacing = automatic_sampling.spacing;
+                }
+                changed = true;
+            }
+            double spacing = parameters.automatic_spacing ? automatic_sampling.spacing : parameters.sample_spacing;
+            ImGui::BeginDisabled(parameters.automatic_spacing);
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::InputDouble("Sample spacing", &spacing, 0.0, 0.0, "%.8g")) {
+                if (std::isfinite(spacing) && spacing > 0.0) {
+                    parameters.sample_spacing = spacing;
+                    changed = true;
+                }
+            }
+            ImGui::EndDisabled();
+            if (changed && fft.enabled) {
+                request_filter_recompute(tab);
+            }
+        }
+        ImGui::PopID();
+        if (tab.filters.processing) {
+            ImGui::TextDisabled("Updating...");
+        }
+        if (!tab.filters.error.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", tab.filters.error.c_str());
+        }
+    }
+    ImGui::End();
+    tab.filters.settings_open = open;
+}
+
 void close_tab(AppState &app, int id) {
     auto it = std::find_if(app.tabs.begin(), app.tabs.end(), [&](const std::unique_ptr<FileTab> &tab) {
         return tab->id == id;
@@ -2960,6 +4554,12 @@ void close_tab(AppState &app, int id) {
     }
     if (tab.swmr_polling && tab.swmr_future.valid()) {
         tab.swmr_future.wait();
+    }
+    if (tab.filters.processing && tab.filters.future.valid()) {
+        if (tab.filters.cancel_requested) {
+            tab.filters.cancel_requested->store(true, std::memory_order_relaxed);
+        }
+        tab.filters.future.wait();
     }
     delete_heat_texture(tab);
     app.tabs.erase(it);
@@ -3011,11 +4611,12 @@ bool toggle_axis_autoscale(FileTab &tab, bool x_axis) {
     range.automatic = !range.automatic;
     if (range.automatic) {
         if (x_axis) {
-            range.min = data.x_min;
-            range.max = data.x_max;
+            range.min = displayed_x_min(tab, data);
+            range.max = displayed_x_max(tab, data);
         } else {
-            range.min = data.kind == LoadedKind::Line1D ? data.value_min : data.y_min;
-            range.max = data.kind == LoadedKind::Line1D ? data.value_max : data.y_max;
+            const auto [display_min, display_max] = displayed_value_range(tab, data);
+            range.min = data.kind == LoadedKind::Line1D ? display_min : displayed_y_min(tab, data);
+            range.max = data.kind == LoadedKind::Line1D ? display_max : displayed_y_max(tab, data);
         }
     }
     return true;
@@ -3338,6 +4939,8 @@ void draw_performance_hud(AppState &app) {
     ImGui::Text("Fast frame: %s", app.last_fast_frame ? "yes" : "no");
     ImGui::Text("Background work: %s", app.last_background_work ? "yes" : "no");
     ImGui::Text("ImGui active item/mouse: %s", app.last_ui_active ? "yes" : "no");
+    ImGui::Text("Window drawable/focused: %s / %s", app.last_window_drawable ? "yes" : "no",
+                app.last_window_focused ? "yes" : "no");
     ImGui::Text("SDL events last frame: %d", app.last_event_count);
     ImGui::Separator();
     ImGui::TextWrapped("GL vendor: %s", app.gl_vendor.c_str());
@@ -3558,6 +5161,7 @@ void build_initial_dock_layout(AppState &app, const ImGuiViewport *viewport, ImG
 }
 
 void layout_windows(AppState &app) {
+    draw_main_menu_bar(app);
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     const ImGuiID dockspace_id = ImHashStr("HDF5MainDockSpace");
     build_initial_dock_layout(app, viewport, dockspace_id);
@@ -3631,7 +5235,9 @@ void layout_windows(AppState &app) {
         if (focus_requested) {
             app.plot_focus_request_id = 0;
         }
+        draw_slice_windows(app, tab);
         draw_file_details_window(app, tab);
+        draw_filter_settings_window(app, tab);
     }
 
     draw_file_picker(app);
@@ -3706,9 +5312,10 @@ std::string default_file_path(int argc, char **argv) {
 }
 
 bool app_has_background_work(const AppState &app) {
-    return std::any_of(app.tabs.begin(), app.tabs.end(), [](const std::unique_ptr<FileTab> &tab) {
-        return tab->loading || tab->swmr_polling;
-    });
+    return app.picker.preview_loading ||
+           std::any_of(app.tabs.begin(), app.tabs.end(), [](const std::unique_ptr<FileTab> &tab) {
+               return tab->loading || tab->swmr_polling || tab->filters.processing;
+           });
 }
 
 bool imgui_wants_fast_frames(const ImGuiIO &io) {
@@ -3718,6 +5325,15 @@ bool imgui_wants_fast_frames(const ImGuiIO &io) {
         }
     }
     return ImGui::IsAnyItemActive();
+}
+
+bool window_is_drawable(Uint32 flags) {
+    return (flags & SDL_WINDOW_SHOWN) != 0 &&
+           (flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) == 0;
+}
+
+bool window_has_input_focus(Uint32 flags) {
+    return (flags & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
 
 std::string gl_string(GLenum name) {
@@ -3801,6 +5417,7 @@ int main(int argc, char **argv) {
 
     bool done = false;
     bool force_redraw = true;
+    auto next_unfocused_frame = std::chrono::steady_clock::now();
     auto process_event = [&](const SDL_Event &event) {
         ImGui_ImplSDL2_ProcessEvent(&event);
         if (event.type == SDL_QUIT) {
@@ -3817,8 +5434,12 @@ int main(int argc, char **argv) {
         SDL_Event event;
         int event_count = 0;
         bool used_idle_wait = false;
+        const Uint32 initial_window_flags = SDL_GetWindowFlags(window);
+        const bool initially_drawable = window_is_drawable(initial_window_flags);
+        const bool initially_focused = window_has_input_focus(initial_window_flags);
+        const bool reduced_visibility = !initially_drawable || !initially_focused;
 
-        if (!force_redraw && !app_has_background_work(app)) {
+        if (reduced_visibility || (!force_redraw && !app_has_background_work(app))) {
             used_idle_wait = true;
             if (SDL_WaitEventTimeout(&event, static_cast<int>(kIdleFrameInterval.count())) != 0) {
                 ++event_count;
@@ -3839,6 +5460,35 @@ int main(int argc, char **argv) {
         for (auto &tab : app.tabs) {
             state_changed = poll_load(*tab) || state_changed;
             state_changed = poll_swmr_live(app, *tab) || state_changed;
+            state_changed = poll_filter_pipeline(*tab) || state_changed;
+        }
+
+        bool background_work = app_has_background_work(app);
+        const Uint32 window_flags = SDL_GetWindowFlags(window);
+        const bool window_drawable = window_is_drawable(window_flags);
+        const bool window_focused = window_has_input_focus(window_flags);
+        app.last_window_drawable = window_drawable;
+        app.last_window_focused = window_focused;
+
+        if (!window_drawable) {
+            force_redraw = true;
+            app.last_event_count = event_count;
+            app.last_used_idle_wait = used_idle_wait;
+            app.last_fast_frame = false;
+            app.last_background_work = background_work;
+            app.last_ui_active = false;
+            continue;
+        }
+
+        const auto before_render = std::chrono::steady_clock::now();
+        if (!window_focused && before_render < next_unfocused_frame) {
+            force_redraw = force_redraw || state_changed || background_work;
+            app.last_event_count = event_count;
+            app.last_used_idle_wait = used_idle_wait;
+            app.last_fast_frame = false;
+            app.last_background_work = background_work;
+            app.last_ui_active = false;
+            continue;
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -3847,6 +5497,7 @@ int main(int argc, char **argv) {
 
         layout_windows(app);
         state_changed = handle_keyboard_shortcuts(app) || state_changed;
+        background_work = app_has_background_work(app);
 
         const bool ui_fast_frames = imgui_wants_fast_frames(io);
         ImGui::Render();
@@ -3859,8 +5510,12 @@ int main(int argc, char **argv) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
 
-        const bool background_work = app_has_background_work(app);
-        const bool fast_frames = state_changed || background_work || ui_fast_frames;
+        if (window_focused) {
+            next_unfocused_frame = before_render;
+        } else {
+            next_unfocused_frame = before_render + kIdleFrameInterval;
+        }
+        const bool fast_frames = window_focused && (state_changed || background_work || ui_fast_frames);
         force_redraw = fast_frames;
         const auto frame_elapsed = std::chrono::steady_clock::now() - frame_start;
         app.last_frame_ms = std::chrono::duration<double, std::milli>(frame_elapsed).count();
@@ -3883,6 +5538,12 @@ int main(int argc, char **argv) {
         }
         if (tab->swmr_polling && tab->swmr_future.valid()) {
             tab->swmr_future.wait();
+        }
+        if (tab->filters.processing && tab->filters.future.valid()) {
+            if (tab->filters.cancel_requested) {
+                tab->filters.cancel_requested->store(true, std::memory_order_relaxed);
+            }
+            tab->filters.future.wait();
         }
         delete_heat_texture(*tab);
     }

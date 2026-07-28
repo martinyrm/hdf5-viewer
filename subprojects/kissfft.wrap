@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/mborgerding/kissfft.git
+revision = 7bce4153c6bc8aba2db0e889e576f9d00505cbe1
+depth = 1
+patch_directory = kissfft
+
+[provide]
+kissfft = kissfft_dep
