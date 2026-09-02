@@ -1,9 +1,222 @@
 # HDF5 ImPlot Viewer
 
-A small C++17 desktop viewer for the HDF5 files in `stability_analyses/`.
-It uses SDL2 + OpenGL, Dear ImGui, ImPlot, and HDF5 through Meson.
+HDF5 ImPlot Viewer is a fast, read-only desktop application for attosecond and
+ultrafast spectroscopy data. Follow spectral features while a measurement is
+still running, compare delay scans and spectrograms side-by-side, and apply
+lightweight smoothing or differentiation and inspect FFTs as the data arrives.
+It is built for the moment when the pulse is short, the beamtime is shorter,
+and you need to know whether the signal is really there.
 
-## Dependencies
+Files are opened locally and are never uploaded or modified.
+
+## Download
+
+Ready-to-run packages are available from the
+[latest GitHub release](https://github.com/martinyrm/hdf5-viewer/releases/latest).
+
+| System | Download |
+| --- | --- |
+| Apple Silicon Mac | `hdf5-imgui-plotter_<version>_macos-arm64.zip` |
+| Intel Mac | `hdf5-imgui-plotter_<version>_macos-x86_64.zip` |
+| Debian 12 | `hdf5-imgui-plotter_<version>_debian12_amd64.deb` |
+| Debian 13 | `hdf5-imgui-plotter_<version>_debian13_amd64.deb` |
+| 64-bit Windows | `hdf5-imgui-plotter_<version>_windows-x86_64.zip` |
+
+### macOS
+
+Unzip the download and open **HDF5 ImPlot Viewer.app**. The application is not
+currently notarized, so macOS may block the first launch. Right-click the app
+and choose **Open**, or allow it in **System Settings > Privacy & Security**.
+
+### Debian 12/13
+
+Install the downloaded package; `apt` will install its runtime dependencies:
+
+```sh
+sudo apt install ./hdf5-imgui-plotter_*_debian12_amd64.deb
+# On Debian 13, use the corresponding *_debian13_amd64.deb file.
+```
+
+Start it by running `hdf5_plotter`.
+
+### Windows
+
+Extract the complete zip and run `hdf5_plotter.exe` inside the extracted
+folder. Keep the accompanying DLL files beside the executable.
+
+## Quick Start
+
+1. Start the viewer and press `O`, or click **Open File**.
+2. Select an HDF5 file. The picker previews its first `comment` or `comments`
+   field before opening it.
+3. Expand groups in the dataset tree, or type part of a known dataset name in
+   the search box.
+4. Select a numeric dataset to plot it.
+5. Drag plot tabs or windows to dock them side-by-side. Each open file has its
+   own browser tab and plot windows.
+
+The dataset browser starts on the left and plots start on the right. Focusing a
+plot also brings its corresponding file tab to the front.
+
+## Supported Data
+
+- Numeric scalar datasets are displayed as values.
+- Numeric 1D datasets are shown as high-contrast line plots.
+- Numeric 2D datasets are shown as Turbo-colormap image or spectrogram plots.
+- String datasets named `comment` or `comments` can be shown as captions above
+  plots. **Show plot captions** is enabled by default and uses the top-most
+  matching comment.
+- Compatible 1D numeric datasets can supply physical X or Y coordinates.
+  Fixed-length numeric array datatypes, such as a `Wavelengths` array, are also
+  recognized as axis candidates.
+
+The viewer currently plots scalar, 1D, and 2D numeric datasets. Use **File
+Details** to inspect datatype, dimensions, storage layout, compression filters,
+chunking, and the active 2D preview plan.
+
+## Axes, Scaling, and Navigation
+
+- After the initial fit, **Auto X** is disabled so the mouse can zoom and pan
+  immediately. Disable **Auto Y** to zoom or pan vertically.
+- The **Scaling** panel provides manual X and Y limits. For 2D plots, color
+  minimum and maximum have independent automatic settings and manual values.
+- Use the **X axis** or **Y axis** selector to replace index coordinates with a
+  compatible dataset. Values stay in their original HDF5 index order.
+- Enable **Sort X ascending** when an ascending physical axis is required. The
+  plotted values are reordered together with the selected X coordinates.
+- Use **Flip X/Y** to transpose a 2D display.
+- Unix timestamp-like X coordinates can be displayed as local date/time or UTC.
+- Descending and non-monotonic 2D coordinate datasets are shown as labels over
+  source-index coordinates. Applying an axis does not silently reverse the
+  image.
+
+## Colormaps and Publication Style
+
+Open **Appearance** beside the **Filters** menu to configure plot presentation:
+
+- **Turbo** is the default sequential colormap.
+- **Red-Blue Diverging** uses a white midpoint for signed or differential data.
+- **Leone** follows a deep-blue, cyan, yellow, coral, and white spectroscopy
+  palette.
+- **Log colour scale** applies logarithmic mapping to positive data and a
+  signed-log mapping when the selected range crosses zero.
+- **Publication plot style** switches plot regions to black text and axes on a
+  white background using the bundled CMU Serif font. The surrounding controls
+  remain in the normal dark interface.
+
+Appearance changes are global and recolor loaded plots without re-reading the
+HDF5 files or changing axis and color limits.
+
+## Live SWMR Measurements
+
+Enable **Live SWMR refresh** in a file tab to follow a file written using HDF5
+Single Writer Multiple Reader mode.
+
+- The file is checked approximately once per second.
+- The selected plot reloads when that dataset's extent changes.
+- The previous plot remains visible while new data is read.
+- Axis autoscale choices and manual color limits are retained across refreshes.
+- Press `Space` to pause or resume live refresh for the active file.
+
+The acquisition software must create and flush the file in HDF5 SWMR mode.
+Ordinary HDF5 files can still be viewed normally with live refresh disabled.
+
+## 2D Slices
+
+Enable **Slice plots** for a 2D dataset only when slices are needed. Separate,
+dockable row and column plots will be created.
+
+- Drag the row or column guide on the heatmap to update a slice.
+- Enter a row or column index directly for precise selection.
+- Slice plot limits follow the visible, zoomed region of the 2D plot.
+- Dock slice windows beside the source heatmap for comparison.
+
+## Display Filters
+
+Filters are non-destructive and run in the background. The original HDF5 data
+is not changed, and the previous result remains visible while a new result is
+calculated.
+
+Open the **Filters** menu to use:
+
+- **Savitzky-Golay**: smoothing or differentiation with live window,
+  polynomial-order, derivative-order, and X/Y-axis controls.
+- **Windowed Average**: a centered moving average along X or Y. Edge windows
+  use available samples and non-finite values are ignored.
+- **FFT**: centered full-spectrum magnitude, power, phase, real, or imaginary
+  output with selectable window function, mean removal, decibel scaling, and
+  automatic or manual sample spacing.
+
+The filter settings window shows stages in execution order. Use the up and down
+arrow buttons to reorder them; enabled stages run from top to bottom.
+
+## Keyboard Shortcuts
+
+Shortcuts apply to the active file or plot when a text field is not being
+edited.
+
+| Key | Action |
+| --- | --- |
+| `O`, `Ctrl+O`, or `Cmd+O` | Open a file |
+| `X` | Toggle X autoscaling |
+| `Y` | Toggle Y autoscaling |
+| `F` | Flip X/Y for a 2D plot |
+| `Space` | Pause or resume live SWMR refresh |
+
+## Large Datasets and Performance
+
+- Large 1D plots retain the loaded data but render a cached min/max envelope
+  appropriate for the current zoom level.
+- Large 2D datasets are sampled directly from HDF5 to fit the GPU texture limit
+  and a conservative cell budget. **File Details** reports the source shape,
+  displayed shape, and row/column sampling stride.
+- 2D slices and filters operate on this sampled display preview, not on every
+  element of an oversized source dataset. Use a dedicated analysis pipeline
+  when full-resolution numerical results are required.
+- CPU work is capped to four threads by default. Set
+  `HDF5_PLOTTER_MAX_THREADS=1` before starting the viewer to minimize CPU use on
+  acquisition computers.
+- Hidden or minimized windows skip OpenGL rendering. Unfocused windows use a
+  reduced update rate while background loading and SWMR checks continue.
+
+Enable **Performance HUD** to see frame timing and the active OpenGL vendor,
+renderer, and version. On Linux, `llvmpipe` or `softpipe` means software
+rendering is being used instead of the GPU.
+
+For Linux graphics diagnostics:
+
+```sh
+sudo apt install mesa-utils
+glxinfo -B
+```
+
+## Troubleshooting
+
+**A compatible axis dataset is missing**
+
+Check that it is numeric and contains the same number of values as the displayed
+X or Y dimension. Candidates in the same HDF5 group are preferred.
+
+**A live file does not update**
+
+Confirm that live refresh is enabled and not paused, that the writer opened the
+file in SWMR mode, and that it flushes dataset extent changes.
+
+**Linux performance is unexpectedly poor**
+
+Open **Performance HUD** and check the OpenGL renderer. If it reports
+`llvmpipe`, install or repair the Mesa/vendor GPU driver. Debian systems
+normally require `libgl1-mesa-dri`.
+
+**A very large 2D plot has fewer displayed points than the source**
+
+This is the expected sampled preview. Open **File Details** to see the exact
+sampling stride.
+
+## Building from Source
+
+Prebuilt releases are recommended for laboratory users. To build locally,
+install the platform dependencies first.
 
 macOS with Homebrew:
 
@@ -14,163 +227,41 @@ brew install meson ninja pkg-config sdl2 hdf5 freetype
 Debian 12/13:
 
 ```sh
-sudo apt install build-essential git meson ninja-build pkg-config libsdl2-dev libhdf5-dev libgl1-mesa-dev libfreetype-dev fonts-dejavu-core
+sudo apt install build-essential git meson ninja-build pkg-config \
+  libsdl2-dev libhdf5-dev libgl1-mesa-dev libfreetype-dev fonts-dejavu-core
 ```
 
-Windows with MSYS2 UCRT64:
+Windows builds use the MSYS2 UCRT64 environment:
 
 ```sh
-pacman -S --needed git zip mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-SDL2 mingw-w64-ucrt-x86_64-hdf5 mingw-w64-ucrt-x86_64-freetype
+pacman -S --needed git zip \
+  mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-meson \
+  mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-SDL2 \
+  mingw-w64-ucrt-x86_64-hdf5 \
+  mingw-w64-ucrt-x86_64-freetype
 ```
 
-Dear ImGui and ImPlot are pinned as Meson wrap subprojects and are downloaded
-on the first `meson setup`. ImGui uses the `v1.90.9-docking` branch tag so the
-app can use Dear ImGui docking with the ImPlot 0.16 API.
-
-## Build and Run
-
-```sh
-meson setup build
-meson compile -C build
-./build/hdf5_plotter stability_analyses/1777392253_delay_analysis.h5
-```
-
-For regular lab use or distribution builds, prefer an optimized build:
+Configure and build an optimized binary:
 
 ```sh
 meson setup build-release --buildtype=release
 meson compile -C build-release
+meson test -C build-release --print-errorlogs
 ```
 
-If no file is passed, the app tries to open
-`stability_analyses/1777392253_delay_analysis.h5`.
-
-## Release Builds
-
-GitHub Actions builds release artifacts for macOS 26 arm64, macOS 26 Intel,
-Windows x86_64, Debian 12, and Debian 13 when a `v*` tag is pushed. See
-[`docs/releasing.md`](docs/releasing.md) for the runtime dependency lists and
-release workflow.
-
-## Plot Behavior
-
-- Scalar datasets are displayed as text.
-- Numeric 1D datasets are shown as line plots.
-- Numeric 2D datasets are shown as Turbo-colored spectrogram/image plots.
-- Multiple files can be opened at once. Each file gets its own tab in the
-  dataset browser and its own dockable plot window.
-- On startup the dataset browser is docked on the left and plot windows are
-  docked on the right; focus a plot to bring its matching file tab forward.
-- Use **Open File** for the built-in file picker, or edit the path in a tab and
-  press **Reload**.
-- The file picker previews the first `comment` or `comments` dataset it finds
-  before opening a file. Hover over an HDF5 file for a tooltip preview, or select
-  it to show the preview caption below the file list.
-- Use **File Details** in a file tab to open optional HDF5 diagnostics,
-  including dataset layout, chunk shape, filters, storage size, and the current
-  2D texture-preview read plan.
-- Keyboard shortcuts are available when text fields are not active: `O`
-  opens the file picker, `Ctrl+O` / `Cmd+O` also opens it, `X` toggles Auto X,
-  `Y` toggles Auto Y, `F` flips X/Y for 2D datasets, and `Space` toggles live
-  SWMR refresh for the active tab.
-- The dataset browser shows HDF5 groups as a collapsible tree. Type in the
-  search box to switch to a flat, filtered result list when you already know a
-  dataset name.
-- Enable **Live SWMR refresh** in a file tab to poll an active SWMR writer and
-  reload the selected plot when that dataset's extent changes.
-- **Show plot captions** is enabled by default and draws a small caption above
-  each plot from the top-most string dataset named `comment` or `comments`.
-- **Performance HUD** shows frame timing, idle/active loop state, SDL event
-  counts, and the OpenGL vendor/renderer/version reported by the host.
-- Axis ranges are inferred from same-group 1D datasets when dimensions match,
-  for example `freqs` for rows and `selected_spectrum_indices` or `timestamps`
-  for columns.
-- The **X axis** selector can force index/column coordinates or replace them
-  with any compatible 1D dataset in the same group.
-- Replacement X-axis datasets that are descending or otherwise not monotonic are
-  displayed in their original index order, with tick labels taken from the
-  source axis values rather than sorted into ascending order.
-- Enable **Sort X ascending** to sort replacement X-axis values into monotonic
-  increasing order and reorder the corresponding line samples or heatmap columns
-  to match.
-- For 2D datasets, **Flip X/Y** transposes the display so rows are shown on X
-  and columns on Y. The **Y axis** selector can also replace row coordinates
-  with a compatible 1D dataset. Scalar HDF5 array datatypes, such as a
-  fixed-length `Wavelengths` array, are treated as 1D numeric axis datasets.
-- Enable **Slice plots** on a 2D dataset to open dockable row and column slice
-  plots. Click the heatmap or type row/column indices to choose the slice.
-- Open **Filters > Savitzky-Golay** to enable or configure a non-destructive
-  display filter for the active plot. Window size, polynomial order, and
-  derivative order update live. A 2D filter can run along displayed X or Y;
-  1D filtering always follows X. Derivatives use sample-index units.
-- Open **Filters > Windowed Average** for a centered moving average along X or
-  Y. Its odd window size updates live, edge windows use the available samples,
-  and non-finite values are ignored.
-- Open **Filters > FFT** for a centered full-spectrum transform. FFT can run
-  along displayed X or Y for 2D data and offers magnitude, power, phase, real,
-  or imaginary output; Rectangular, Hann, Hamming, and Blackman windows; mean
-  removal; optional decibel scaling; and automatic or manual sample spacing.
-  Uniform selected axis values produce physical frequency coordinates,
-  otherwise the axis is shown in cycles per sample.
-- The filter settings window shows the pipeline from top to bottom. Use the
-  arrow buttons beside a stage to move it earlier or later; enabled stages are
-  recomputed immediately in the displayed order.
-- The **Scaling** panel exposes auto/manual X and Y ranges for every plot. For
-  2D datasets, color minimum and color maximum each have their own auto/manual
-  checkbox.
-- **Auto X** starts disabled after the initial data fit so mouse zooming and
-  panning work immediately. Disable **Auto Y** to manually zoom Y as well; the
-  edited range fields stay linked to the current plot view. Auto/manual scaling
-  choices are preserved across axis-definition changes and SWMR refreshes.
-- Unix timestamp-like X axes can be formatted as local date/time or UTC.
-- 2D previews preserve HDF5 row/column order. Descending or non-monotonic axis
-  datasets are shown as labels over source-index coordinates, so applying an
-  axis never silently reverses the underlying image.
-- Line plots use a fixed high-contrast palette against the dark UI.
-- Dear ImGui is built with FreeType when `freetype2` is available. The app
-  loads a platform TrueType font and bakes the font atlas at the window's
-  framebuffer scale for sharper text on high-DPI displays.
-
-## Performance Notes
-
-- HDF5 dataset reads run on a worker thread so the UI remains responsive.
-  Access to the HDF5 C API is serialized because common HDF5 builds are not
-  thread-safe.
-- SWMR refresh is opt-in and polls once per second. The poll checks metadata in
-  SWMR read mode and only starts a full plot reload when the selected dataset
-  shape changes. The previous plot remains visible while the refresh loads, and
-  the current X/Y/color scaling choices are preserved.
-- Large 1D lines are cached as a viewport-aware min/max envelope, so zoomed-out
-  views do not push millions of vertices through ImPlot each frame.
-- The render loop is event-driven while idle: static plots wait for input or a
-  short idle tick instead of repainting continuously. Mouse interaction,
-  loading, and SWMR polling still use about 60 FPS pacing while focused.
-  Hidden or minimized windows skip OpenGL rendering, and unfocused windows are
-  limited to the idle cadence. Background loading and SWMR checks continue.
-- 2D datasets are sampled to a GPU texture capped by the current OpenGL maximum
-  texture size and a conservative cell budget. Turbo color mapping is computed
-  in parallel on CPU, then uploaded once as an RGBA texture and drawn with
-  `ImPlot::PlotImage`.
-- CPU-side min/max and color conversion are capped to four worker threads by
-  default. Set `HDF5_PLOTTER_MAX_THREADS=1` for lowest CPU impact, or a larger
-  value for faster initial loading on workstation machines.
-- Filter stages run on background workers and keep the previous filtered result
-  visible until a reconfigured result is ready. Plot rendering, autoscaling,
-  heatmap colors, and 2D slice windows all consume the same cached pipeline
-  output; loaded HDF5 values are never modified.
-- FFT calculations use the BSD-licensed KISS FFT library as a statically linked
-  Meson fallback, so FFT adds no runtime package dependency.
-- ImPlot itself is immediate-mode and CPU-driven for plot geometry. The main
-  GPU acceleration here is texture-backed rendering for 2D datasets.
-
-Useful Linux checks:
+Run it with a file path or start without one and use the file picker:
 
 ```sh
-glxinfo -B
-LIBGL_DEBUG=verbose ./build-release/hdf5_plotter your_file.h5
-perf top -p "$(pidof hdf5_plotter)"
+./build-release/hdf5_plotter measurement.h5
 ```
 
-In `glxinfo -B` or the app's **Performance HUD**, `llvmpipe` or `softpipe`
-means Mesa is using software rendering rather than the GPU. On NVIDIA systems,
-also check `nvidia-smi`; on Intel, `intel_gpu_top`; on AMD, `radeontop`.
+Dear ImGui, ImPlot, and KISS FFT are pinned Meson subprojects and are downloaded
+automatically during the first setup. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for their license notices.
+
+Release packages are built by GitHub Actions for macOS arm64, macOS x86_64,
+Debian 12, Debian 13, and Windows x86_64 whenever a `v*` tag is pushed. Maintainer
+instructions are in [docs/releasing.md](docs/releasing.md).
