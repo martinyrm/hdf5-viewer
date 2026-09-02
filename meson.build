@@ -39,6 +39,7 @@ executable(
   files(
     'src/main.cpp',
     'src/fft_transform.cpp',
+    'src/plot_colormap.cpp',
     'src/plot_axis_mapping.cpp',
     'src/savitzky_golay.cpp',
     'src/windowed_average.cpp',
@@ -53,6 +54,12 @@ executable(
     threads_dep,
   ],
   install: true,
+)
+
+install_data(
+  'assets/fonts/cmunrm.ttf',
+  'assets/fonts/OFL.txt',
+  install_dir: join_paths(get_option('datadir'), 'hdf5-imgui-plotter', 'fonts'),
 )
 
 savitzky_golay_test = executable(
@@ -104,3 +111,14 @@ plot_axis_mapping_test = executable(
 )
 
 test('plot-axis-mapping', plot_axis_mapping_test)
+
+plot_colormap_test = executable(
+  'plot_colormap_test',
+  files(
+    'tests/plot_colormap_test.cpp',
+    'src/plot_colormap.cpp',
+  ),
+  include_directories: include_directories('src'),
+)
+
+test('plot-colormap', plot_colormap_test)

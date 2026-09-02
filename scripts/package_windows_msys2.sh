@@ -19,11 +19,12 @@ if [[ -z "${MINGW_PREFIX:-}" ]]; then
 fi
 
 rm -rf "$out_dir"
-mkdir -p "$out_dir"
+mkdir -p "$out_dir/fonts"
 cp -p "$exe" "$out_dir/hdf5_plotter.exe"
 cp -p README.md "$out_dir/README.md"
 cp -p docs/releasing.md "$out_dir/RELEASING.md"
 cp -p THIRD_PARTY_NOTICES.md "$out_dir/THIRD_PARTY_NOTICES.md"
+cp -p assets/fonts/cmunrm.ttf assets/fonts/OFL.txt "$out_dir/fonts/"
 
 cat > "$out_dir/RUNTIME-DEPS.txt" <<DEPS
 This Windows zip is self-contained for the MSYS2/MinGW runtime libraries used by

@@ -17,9 +17,10 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources/fonts"
 cp -p "$binary" "$app/Contents/MacOS/hdf5_plotter"
 cp -p THIRD_PARTY_NOTICES.md "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp -p assets/fonts/cmunrm.ttf assets/fonts/OFL.txt "$app/Contents/Resources/fonts/"
 
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -68,10 +68,12 @@ jobs:
           package="hdf5-imgui-plotter"
           arch="amd64"
           root="dist/${package}_${VERSION}_debian${{ matrix.version }}_${arch}"
-          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/$package"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/$package" \
+            "$root/usr/share/$package/fonts"
           install -m 0755 build-release/hdf5_plotter "$root/usr/bin/hdf5_plotter"
           install -m 0644 README.md "$root/usr/share/doc/$package/README.md"
           install -m 0644 THIRD_PARTY_NOTICES.md "$root/usr/share/doc/$package/THIRD_PARTY_NOTICES.md"
+          install -m 0644 assets/fonts/cmunrm.ttf assets/fonts/OFL.txt "$root/usr/share/$package/fonts/"
           cat > "$root/usr/share/doc/$package/RUNTIME-DEPS.txt" <<DEPS
           Runtime dependencies for Debian ${{ matrix.version }} (${{ matrix.codename }}):
             libc6

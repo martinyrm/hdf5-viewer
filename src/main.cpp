@@ -4,6 +4,7 @@
 #include "imgui_impl_sdl2.h"
 #include "implot.h"
 #include "fft_transform.h"
+#include "plot_colormap.h"
 #include "plot_axis_mapping.h"
 #include "savitzky_golay.h"
 #include "windowed_average.h"
@@ -198,6 +199,8 @@ struct LoadedDataset {
     float applied_color_min = std::numeric_limits<float>::quiet_NaN();
     float applied_color_max = std::numeric_limits<float>::quiet_NaN();
     int applied_color_generation = -1;
+    hdf5_plotter::PlotColormap applied_colormap = hdf5_plotter::PlotColormap::Turbo;
+    bool applied_logarithmic_color = false;
 };
 
 struct LoadConfig {
@@ -419,12 +422,22 @@ struct FilePicker {
     std::vector<CommentPreviewCacheEntry> preview_cache;
 };
 
+struct AppearanceState {
+    hdf5_plotter::PlotColormap colormap = hdf5_plotter::PlotColormap::Turbo;
+    bool logarithmic_color = false;
+    bool publication_style = false;
+    bool settings_open = false;
+    ImFont *publication_font = nullptr;
+    std::string publication_font_path;
+};
+
 struct AppState {
     std::vector<std::unique_ptr<FileTab>> tabs;
     int next_tab_id = 1;
     int active_tab_id = 0;
     int plot_focus_request_id = 0;
     bool show_plot_captions = true;
+    AppearanceState appearance;
     FilePicker picker;
     bool dock_layout_built = false;
     ImGuiID dockspace_id = 0;
@@ -1423,36 +1436,14 @@ std::pair<double, double> effective_range(double min_value, double max_value) {
     return {min_value, max_value};
 }
 
-uint8_t to_byte(float value) {
-    value = std::clamp(value, 0.0f, 1.0f);
-    return static_cast<uint8_t>(std::lround(value * 255.0f));
-}
-
-std::array<uint8_t, 4> turbo_rgba(float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    const float t2 = t * t;
-    const float t3 = t2 * t;
-    const float t4 = t3 * t;
-    const float t5 = t4 * t;
-
-    const float r = 0.13572138f + 4.61539260f * t - 42.66032258f * t2 + 132.13108234f * t3 -
-                    152.94239396f * t4 + 59.28637943f * t5;
-    const float g = 0.09140261f + 2.19418839f * t + 4.84296658f * t2 - 14.18503333f * t3 +
-                    4.27729857f * t4 + 2.82956604f * t5;
-    const float b = 0.10667330f + 12.64194608f * t - 60.58204836f * t2 + 110.36276771f * t3 -
-                    89.90310912f * t4 + 27.34824973f * t5;
-    return {to_byte(r), to_byte(g), to_byte(b), 255};
-}
-
-std::vector<uint8_t> make_turbo_rgba(const std::vector<float> &values, float min_value, float max_value) {
+std::vector<uint8_t> make_plot_rgba(const std::vector<float> &values, float min_value, float max_value,
+                                    hdf5_plotter::PlotColormap colormap, bool logarithmic) {
     std::vector<uint8_t> rgba(values.size() * 4);
-    const float denom = max_value - min_value;
-    const float safe_denom = denom == 0.0f ? 1.0f : denom;
     parallel_for(values.size(), [&](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
             const float value = values[i];
-            const float t = std::isfinite(value) ? (value - min_value) / safe_denom : 0.0f;
-            const auto color = turbo_rgba(t);
+            const float t = hdf5_plotter::normalize_colormap_value(value, min_value, max_value, logarithmic);
+            const auto color = hdf5_plotter::plot_colormap_rgba(colormap, std::isfinite(t) ? t : 0.0f);
             rgba[i * 4 + 0] = color[0];
             rgba[i * 4 + 1] = color[1];
             rgba[i * 4 + 2] = color[2];
@@ -2029,7 +2020,8 @@ LoadResult load_dataset_worker(int token, std::string file_path, DatasetInfo inf
             const auto minmax = finite_minmax(values);
             const float min_value = minmax.first;
             const float max_value = minmax.second;
-            std::vector<uint8_t> rgba = make_turbo_rgba(values, min_value, max_value);
+            std::vector<uint8_t> rgba =
+                make_plot_rgba(values, min_value, max_value, hdf5_plotter::PlotColormap::Turbo, false);
 
             result.data->kind = LoadedKind::Heatmap2D;
             result.data->source_rows = info.dims[0];
@@ -2657,7 +2649,8 @@ void upload_heat_texture(FileTab &tab, LoadedDataset &data) {
 }
 
 void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, const std::vector<float> &values,
-                                int value_generation, float min_value, float max_value) {
+                                int value_generation, float min_value, float max_value,
+                                hdf5_plotter::PlotColormap colormap, bool logarithmic) {
     if (data.kind != LoadedKind::Heatmap2D || values.empty() || tab.heat_texture == 0) {
         return;
     }
@@ -2667,11 +2660,12 @@ void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, const std::ve
     };
     if (data.applied_color_generation == value_generation && std::isfinite(data.applied_color_min) &&
         std::isfinite(data.applied_color_max) &&
-        nearly_same(data.applied_color_min, min_value) && nearly_same(data.applied_color_max, max_value)) {
+        nearly_same(data.applied_color_min, min_value) && nearly_same(data.applied_color_max, max_value) &&
+        data.applied_colormap == colormap && data.applied_logarithmic_color == logarithmic) {
         return;
     }
 
-    std::vector<uint8_t> rgba = make_turbo_rgba(values, min_value, max_value);
+    std::vector<uint8_t> rgba = make_plot_rgba(values, min_value, max_value, colormap, logarithmic);
     glBindTexture(GL_TEXTURE_2D, tab.heat_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, data.texture_width, data.texture_height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
@@ -2679,6 +2673,8 @@ void update_heat_texture_colors(FileTab &tab, LoadedDataset &data, const std::ve
     data.applied_color_min = min_value;
     data.applied_color_max = max_value;
     data.applied_color_generation = value_generation;
+    data.applied_colormap = colormap;
+    data.applied_logarithmic_color = logarithmic;
 }
 
 void invalidate_plot(FileTab &tab) {
@@ -2822,7 +2818,7 @@ void start_load(AppState &app, FileTab &tab, int index, bool keep_axis_choice = 
                                  x_axis_info, has_x_axis_info, y_axis_info, has_y_axis_info, config);
 }
 
-bool poll_load(FileTab &tab) {
+bool poll_load(const AppState &app, FileTab &tab) {
     if (!tab.loading || !tab.load_future.valid()) {
         return false;
     }
@@ -2870,7 +2866,8 @@ bool poll_load(FileTab &tab) {
             const auto [color_min, color_max] =
                 effective_color_range(tab.controls.color, display_min, display_max);
             update_heat_texture_colors(tab, *tab.loaded, displayed_plot_values(tab, *tab.loaded),
-                                       displayed_value_generation(tab, *tab.loaded), color_min, color_max);
+                                       displayed_value_generation(tab, *tab.loaded), color_min, color_max,
+                                       app.appearance.colormap, app.appearance.logarithmic_color);
         }
     }
     if (!quiet_load) {
@@ -3375,7 +3372,7 @@ void build_column_slice(const LoadedDataset &data, const std::vector<float> &val
     }
 }
 
-void draw_color_strip(float min_value, float max_value) {
+void draw_color_strip(float min_value, float max_value, hdf5_plotter::PlotColormap colormap) {
     const ImVec2 start = ImGui::GetCursorScreenPos();
     const ImVec2 size(std::max(160.0f, ImGui::GetContentRegionAvail().x), 14.0f);
     ImDrawList *draw_list = ImGui::GetWindowDrawList();
@@ -3383,7 +3380,7 @@ void draw_color_strip(float min_value, float max_value) {
     for (int i = 0; i < steps; ++i) {
         const float t0 = static_cast<float>(i) / static_cast<float>(steps);
         const float t1 = static_cast<float>(i + 1) / static_cast<float>(steps);
-        const auto c = turbo_rgba(t0);
+        const auto c = hdf5_plotter::plot_colormap_rgba(colormap, t0);
         const ImU32 col = IM_COL32(c[0], c[1], c[2], 255);
         draw_list->AddRectFilled(ImVec2(start.x + size.x * t0, start.y), ImVec2(start.x + size.x * t1 + 1.0f, start.y + size.y),
                                  col);
@@ -3804,6 +3801,58 @@ void draw_heatmap_slice_overlay(FileTab &tab, LoadedDataset &data) {
     }
 }
 
+class PlotAppearanceScope {
+  public:
+    explicit PlotAppearanceScope(const AppState &app) : active_(app.appearance.publication_style) {
+        if (!active_) {
+            return;
+        }
+        if (app.appearance.publication_font != nullptr) {
+            ImGui::PushFont(app.appearance.publication_font);
+            font_pushed_ = true;
+        }
+        ImPlot::PushStyleColor(ImPlotCol_FrameBg, ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_PlotBg, ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_PlotBorder, ImVec4(0.02f, 0.02f, 0.02f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_LegendBg, ImVec4(1.00f, 1.00f, 1.00f, 0.94f));
+        ImPlot::PushStyleColor(ImPlotCol_LegendBorder, ImVec4(0.05f, 0.05f, 0.05f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_LegendText, ImVec4(0.02f, 0.02f, 0.02f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_TitleText, ImVec4(0.02f, 0.02f, 0.02f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_InlayText, ImVec4(0.02f, 0.02f, 0.02f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisText, ImVec4(0.02f, 0.02f, 0.02f, 1.00f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisGrid, ImVec4(0.00f, 0.00f, 0.00f, 0.14f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisTick, ImVec4(0.00f, 0.00f, 0.00f, 0.78f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisBg, ImVec4(0.00f, 0.00f, 0.00f, 0.00f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisBgHovered, ImVec4(0.10f, 0.30f, 0.65f, 0.08f));
+        ImPlot::PushStyleColor(ImPlotCol_AxisBgActive, ImVec4(0.10f, 0.30f, 0.65f, 0.14f));
+        ImPlot::PushStyleColor(ImPlotCol_Selection, ImVec4(0.08f, 0.25f, 0.55f, 0.40f));
+        ImPlot::PushStyleColor(ImPlotCol_Crosshairs, ImVec4(0.00f, 0.00f, 0.00f, 0.60f));
+        ImPlot::PushStyleVar(ImPlotStyleVar_PlotBorderSize, 1.25f);
+    }
+
+    PlotAppearanceScope(const PlotAppearanceScope &) = delete;
+    PlotAppearanceScope &operator=(const PlotAppearanceScope &) = delete;
+
+    ~PlotAppearanceScope() {
+        if (!active_) {
+            return;
+        }
+        ImPlot::PopStyleVar();
+        ImPlot::PopStyleColor(16);
+        if (font_pushed_) {
+            ImGui::PopFont();
+        }
+    }
+
+  private:
+    bool active_ = false;
+    bool font_pushed_ = false;
+};
+
+ImVec4 publication_line_color(bool publication_style, const ImVec4 &normal_color) {
+    return publication_style ? ImVec4(0.03f, 0.03f, 0.03f, 1.0f) : normal_color;
+}
+
 void draw_loaded_plot(const AppState &app, FileTab &tab) {
     if (app.show_plot_captions && !tab.caption.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.86f, 0.90f, 1.0f));
@@ -3858,6 +3907,7 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
         } else {
             ImPlot::SetNextAxisLinks(ImAxis_Y1, &tab.controls.y.min, &tab.controls.y.max);
         }
+        PlotAppearanceScope plot_appearance(app);
         if (ImPlot::BeginPlot("##line", ImVec2(-1, -1))) {
             ImPlot::SetupAxes(displayed_x_label(tab, data).c_str(), displayed_value_label(tab, data).c_str());
             AxisValueFormatterData x_formatter;
@@ -3871,7 +3921,10 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
                                !x_overridden && data.x_values_decreasing, x_min, x_max, tab.line_cache, cache_min,
                                cache_max, plot_width);
             if (!tab.line_cache.x.empty()) {
-                ImPlot::SetNextLineStyle(high_contrast_line_color(tab.selected_index), 1.8f);
+                ImPlot::SetNextLineStyle(
+                    publication_line_color(app.appearance.publication_style,
+                                           high_contrast_line_color(tab.selected_index)),
+                    app.appearance.publication_style ? 1.5f : 1.8f);
                 ImPlot::PlotLine(base_name(data.info.path).c_str(), tab.line_cache.x.data(), tab.line_cache.y.data(),
                                  static_cast<int>(tab.line_cache.x.size()));
             }
@@ -3888,14 +3941,17 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
         const double y_max = displayed_y_max(tab, data);
         const auto [display_min, display_max] = displayed_value_range(tab, data);
         const auto [color_min, color_max] = effective_color_range(tab.controls.color, display_min, display_max);
-        update_heat_texture_colors(tab, data, plot_values, displayed_value_generation(tab, data), color_min, color_max);
+        update_heat_texture_colors(tab, data, plot_values, displayed_value_generation(tab, data), color_min,
+                                   color_max, app.appearance.colormap, app.appearance.logarithmic_color);
         if (filter_output_ready(tab, data) && !tab.filters.value_label.empty()) {
             ImGui::TextUnformatted(tab.filters.value_label.c_str());
         }
-        ImGui::Text("Turbo texture: %d x %d from %s x %s cells, range %.6g to %.6g", data.texture_width,
-                    data.texture_height, count_label(data.source_rows).c_str(), count_label(data.source_cols).c_str(),
+        ImGui::Text("%s%s texture: %d x %d from %s x %s cells, range %.6g to %.6g",
+                    hdf5_plotter::plot_colormap_name(app.appearance.colormap),
+                    app.appearance.logarithmic_color ? " log" : "", data.texture_width, data.texture_height,
+                    count_label(data.source_rows).c_str(), count_label(data.source_cols).c_str(),
                     static_cast<double>(color_min), static_cast<double>(color_max));
-        draw_color_strip(color_min, color_max);
+        draw_color_strip(color_min, color_max, app.appearance.colormap);
 
         if (tab.controls.x.automatic) {
             ImPlot::SetNextAxisToFit(ImAxis_X1);
@@ -3908,6 +3964,7 @@ void draw_loaded_plot(const AppState &app, FileTab &tab) {
             ImPlot::SetNextAxisLinks(ImAxis_Y1, &tab.controls.y.min, &tab.controls.y.max);
         }
 
+        PlotAppearanceScope plot_appearance(app);
         if (tab.heat_texture != 0 && ImPlot::BeginPlot("##heatmap", ImVec2(-1, -1))) {
             ImPlot::SetupAxes(displayed_x_label(tab, data).c_str(), displayed_y_label(tab, data).c_str());
             AxisValueFormatterData x_formatter;
@@ -3946,7 +4003,7 @@ std::string column_slice_window_title(const FileTab &tab) {
     return "Column Slice: " + tab_title(tab) + "##column-slice-" + std::to_string(tab.id);
 }
 
-void draw_slice_line_plot(FileTab &tab, LoadedDataset &data, bool row_slice) {
+void draw_slice_line_plot(const AppState &app, FileTab &tab, LoadedDataset &data, bool row_slice) {
     if (!heatmap_slice_ready(data)) {
         ImGui::TextUnformatted("No 2D preview is loaded.");
         return;
@@ -4008,6 +4065,7 @@ void draw_slice_line_plot(FileTab &tab, LoadedDataset &data, bool row_slice) {
     ImPlot::SetNextAxisLimits(ImAxis_X1, view_min, view_max, ImPlotCond_Always);
     ImPlot::SetNextAxisLimits(ImAxis_Y1, value_min, value_max, ImPlotCond_Always);
     const char *plot_id = row_slice ? "##row-slice-plot" : "##column-slice-plot";
+    PlotAppearanceScope plot_appearance(app);
     if (ImPlot::BeginPlot(plot_id, ImVec2(-1, -1))) {
         const std::string &x_label = row_slice ? displayed_x_label(tab, data) : displayed_y_label(tab, data);
         ImPlot::SetupAxes(x_label.c_str(), displayed_value_label(tab, data).c_str());
@@ -4024,8 +4082,13 @@ void draw_slice_line_plot(FileTab &tab, LoadedDataset &data, bool row_slice) {
                    looks_like_unix_time_axis(data)) {
             ImPlot::SetupAxisFormat(ImAxis_X1, unix_time_formatter, &tab.x_datetime_utc);
         }
-        ImPlot::SetNextLineStyle(row_slice ? ImVec4(0.10f, 0.95f, 1.0f, 1.0f) : ImVec4(1.0f, 0.88f, 0.10f, 1.0f),
-                                 1.8f);
+        const ImVec4 normal_color =
+            row_slice ? ImVec4(0.10f, 0.95f, 1.0f, 1.0f) : ImVec4(1.0f, 0.88f, 0.10f, 1.0f);
+        const ImVec4 line_color = app.appearance.publication_style
+                                      ? (row_slice ? ImVec4(0.05f, 0.20f, 0.55f, 1.0f)
+                                                   : ImVec4(0.65f, 0.08f, 0.08f, 1.0f))
+                                      : normal_color;
+        ImPlot::SetNextLineStyle(line_color, app.appearance.publication_style ? 1.5f : 1.8f);
         ImPlot::PlotLine(row_slice ? "row" : "column", x.data(), y.data(), static_cast<int>(y.size()),
                          ImPlotLineFlags_SkipNaN);
         ImPlot::EndPlot();
@@ -4053,7 +4116,7 @@ void draw_slice_windows(AppState &app, FileTab &tab) {
             if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
                 app.active_tab_id = tab.id;
             }
-            draw_slice_line_plot(tab, data, true);
+            draw_slice_line_plot(app, tab, data, true);
         }
         ImGui::End();
         tab.slices.row_window_open = open;
@@ -4072,7 +4135,7 @@ void draw_slice_windows(AppState &app, FileTab &tab) {
             if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
                 app.active_tab_id = tab.id;
             }
-            draw_slice_line_plot(tab, data, false);
+            draw_slice_line_plot(app, tab, data, false);
         }
         ImGui::End();
         tab.slices.column_window_open = open;
@@ -4269,6 +4332,20 @@ void draw_filter_pipeline_order(FileTab &tab) {
     }
 }
 
+void draw_colormap_menu_items(AppearanceState &appearance) {
+    const std::array<hdf5_plotter::PlotColormap, 3> colormaps = {
+        hdf5_plotter::PlotColormap::Turbo,
+        hdf5_plotter::PlotColormap::RedBlue,
+        hdf5_plotter::PlotColormap::Leone,
+    };
+    for (hdf5_plotter::PlotColormap colormap : colormaps) {
+        if (ImGui::MenuItem(hdf5_plotter::plot_colormap_name(colormap), nullptr,
+                            appearance.colormap == colormap)) {
+            appearance.colormap = colormap;
+        }
+    }
+}
+
 void draw_main_menu_bar(AppState &app) {
     if (!ImGui::BeginMainMenuBar()) {
         return;
@@ -4327,7 +4404,56 @@ void draw_main_menu_bar(AppState &app) {
         }
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Appearance")) {
+        if (ImGui::BeginMenu("Colour map")) {
+            draw_colormap_menu_items(app.appearance);
+            ImGui::EndMenu();
+        }
+        ImGui::MenuItem("Log colour scale", nullptr, &app.appearance.logarithmic_color);
+        ImGui::MenuItem("Publication plot style", nullptr, &app.appearance.publication_style);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Settings...")) {
+            app.appearance.settings_open = true;
+        }
+        ImGui::EndMenu();
+    }
     ImGui::EndMainMenuBar();
+}
+
+void draw_appearance_settings_window(AppState &app) {
+    if (!app.appearance.settings_open) {
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(430, 300), ImGuiCond_FirstUseEver);
+    bool open = app.appearance.settings_open;
+    if (ImGui::Begin("Appearance", &open)) {
+        ImGui::SeparatorText("2D colour mapping");
+        static const char *colormap_names[] = {"Turbo", "Red-Blue Diverging", "Leone"};
+        int colormap = static_cast<int>(app.appearance.colormap);
+        ImGui::SetNextItemWidth(210.0f);
+        if (ImGui::Combo("Colour map", &colormap, colormap_names, IM_ARRAYSIZE(colormap_names))) {
+            app.appearance.colormap = static_cast<hdf5_plotter::PlotColormap>(colormap);
+        }
+        draw_color_strip(0.0f, 1.0f, app.appearance.colormap);
+        ImGui::Checkbox("Log colour scale", &app.appearance.logarithmic_color);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Uses logarithmic scaling for positive data and signed-log scaling across zero.");
+        }
+
+        ImGui::SeparatorText("Plot region");
+        ImGui::Checkbox("Publication plot style", &app.appearance.publication_style);
+        if (app.appearance.publication_font != nullptr) {
+            ImGui::TextDisabled("CMU Serif");
+            if (ImGui::IsItemHovered() && !app.appearance.publication_font_path.empty()) {
+                ImGui::SetTooltip("%s", app.appearance.publication_font_path.c_str());
+            }
+        } else {
+            ImGui::TextDisabled("CMU Serif unavailable; using the interface font.");
+        }
+    }
+    ImGui::End();
+    app.appearance.settings_open = open;
 }
 
 std::string filter_window_title(const FileTab &tab) {
@@ -5240,6 +5366,7 @@ void layout_windows(AppState &app) {
         draw_filter_settings_window(app, tab);
     }
 
+    draw_appearance_settings_window(app);
     draw_file_picker(app);
     draw_performance_hud(app);
 }
@@ -5247,7 +5374,8 @@ void layout_windows(AppState &app) {
 ImPlotColormap register_turbo_colormap() {
     std::array<ImVec4, 256> colors{};
     for (size_t i = 0; i < colors.size(); ++i) {
-        const auto rgba = turbo_rgba(static_cast<float>(i) / static_cast<float>(colors.size() - 1));
+        const auto rgba = hdf5_plotter::plot_colormap_rgba(
+            hdf5_plotter::PlotColormap::Turbo, static_cast<float>(i) / static_cast<float>(colors.size() - 1));
         colors[i] = ImVec4(static_cast<float>(rgba[0]) / 255.0f, static_cast<float>(rgba[1]) / 255.0f,
                            static_cast<float>(rgba[2]) / 255.0f, 1.0f);
     }
@@ -5269,7 +5397,7 @@ float framebuffer_font_scale(SDL_Window *window) {
     return std::clamp(std::max(scale_x, scale_y), 1.0f, 4.0f);
 }
 
-void load_ui_font(ImGuiIO &io, float framebuffer_scale) {
+ImFont *load_ui_font(ImGuiIO &io, float framebuffer_scale) {
     static const std::array<const char *, 9> candidates = {
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -5292,12 +5420,60 @@ void load_ui_font(ImGuiIO &io, float framebuffer_scale) {
             cfg.OversampleV = 2;
             cfg.PixelSnapH = true;
             cfg.RasterizerMultiply = 1.05f;
-            if (io.Fonts->AddFontFromFileTTF(path, baked_size, &cfg) != nullptr) {
-                return;
+            if (ImFont *font = io.Fonts->AddFontFromFileTTF(path, baked_size, &cfg); font != nullptr) {
+                return font;
             }
         }
     }
-    io.Fonts->AddFontDefault();
+    return io.Fonts->AddFontDefault();
+}
+
+std::filesystem::path executable_base_path() {
+    char *raw_path = SDL_GetBasePath();
+    if (raw_path == nullptr) {
+        return {};
+    }
+    std::filesystem::path path(raw_path);
+    SDL_free(raw_path);
+    return path;
+}
+
+ImFont *load_publication_font(ImGuiIO &io, float framebuffer_scale, std::string &loaded_path) {
+    const std::filesystem::path base_path = executable_base_path();
+    const std::array<std::filesystem::path, 10> candidates = {
+        std::filesystem::path("assets/fonts/cmunrm.ttf"),
+        base_path / "../assets/fonts/cmunrm.ttf",
+        base_path / "fonts/cmunrm.ttf",
+        base_path / "../Resources/fonts/cmunrm.ttf",
+        base_path / "../share/hdf5-imgui-plotter/fonts/cmunrm.ttf",
+        std::filesystem::path("C:\\Windows\\Fonts\\cmunrm.ttf"),
+        std::filesystem::path("/Library/Fonts/cmunrm.ttf"),
+        std::filesystem::path("/System/Library/Fonts/cmunrm.ttf"),
+        std::filesystem::path("/usr/share/fonts/truetype/cmu/cmunrm.ttf"),
+        std::filesystem::path("/usr/share/fonts/truetype/cm-unicode/cmunrm.ttf"),
+    };
+
+    const float baked_size = 17.0f * std::max(1.0f, framebuffer_scale);
+    for (const std::filesystem::path &path : candidates) {
+        std::error_code error;
+        if (path.empty() || !std::filesystem::is_regular_file(path, error)) {
+            continue;
+        }
+        ImFontConfig cfg;
+        cfg.OversampleH = 3;
+        cfg.OversampleV = 2;
+        cfg.PixelSnapH = false;
+        cfg.RasterizerMultiply = 1.08f;
+        const std::string path_string = path.lexically_normal().string();
+        if (ImFont *font = io.Fonts->AddFontFromFileTTF(path_string.c_str(), baked_size, &cfg,
+                                                       io.Fonts->GetGlyphRangesGreek());
+            font != nullptr) {
+            loaded_path = path_string;
+            return font;
+        }
+    }
+    loaded_path.clear();
+    return nullptr;
 }
 
 std::string default_file_path(int argc, char **argv) {
@@ -5385,7 +5561,10 @@ int main(int argc, char **argv) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     const float ui_framebuffer_scale = framebuffer_font_scale(window);
-    load_ui_font(io, ui_framebuffer_scale);
+    ImFont *ui_font = load_ui_font(io, ui_framebuffer_scale);
+    std::string publication_font_path;
+    ImFont *publication_font = load_publication_font(io, ui_framebuffer_scale, publication_font_path);
+    io.FontDefault = ui_font;
 
     ImGui::StyleColorsDark();
     ImPlot::GetStyle().Colormap = register_turbo_colormap();
@@ -5395,6 +5574,8 @@ int main(int argc, char **argv) {
 
     AppState app;
     app.ui_framebuffer_scale = ui_framebuffer_scale;
+    app.appearance.publication_font = publication_font;
+    app.appearance.publication_font_path = std::move(publication_font_path);
     app.gl_vendor = gl_string(GL_VENDOR);
     app.gl_renderer = gl_string(GL_RENDERER);
     app.gl_version = gl_string(GL_VERSION);
@@ -5458,7 +5639,7 @@ int main(int argc, char **argv) {
 
         bool state_changed = false;
         for (auto &tab : app.tabs) {
-            state_changed = poll_load(*tab) || state_changed;
+            state_changed = poll_load(app, *tab) || state_changed;
             state_changed = poll_swmr_live(app, *tab) || state_changed;
             state_changed = poll_filter_pipeline(*tab) || state_changed;
         }
